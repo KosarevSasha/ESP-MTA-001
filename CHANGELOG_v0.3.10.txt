@@ -1,0 +1,12 @@
+MTA Firmware v0.3.10 MVP — release notes
+
+Base: user-provided MTA_Firmware_v0.3.9_MVP(2).ino (2186 lines).
+Changes:
+1. Added local mta_secrets.h include, replacing plaintext Wi-Fi settings.
+2. Added X-MTA-Key to HTTP heartbeat POST.
+3. Added X-MTA-Key to HTTP event POST.
+4. Updated firmware version banner to v0.3.10.
+Unchanged: StateManager, DispenseManager, TimerManager, OutputManager, event FIFO/NVS logic, GPIO, event payloads and URLs (still 192.168.1.106:8000).
+Preconditions: Fill mta_secrets.h with correct Wi-Fi credentials and the MTA-001 device key from the server .env. Never send or commit that file.
+Caution: Existing committed v0.3.9 included a real Wi-Fi password; consider changing it on the router. The SQLite test inventory currently identifies WATER, while firmware events use WATER_05; do not test LOAD/SALE until the IDs are reconciled.
+Build validation: source-level changes inspected; compilation/hardware operation not yet verified.

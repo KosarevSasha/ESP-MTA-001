@@ -1,0 +1,14 @@
+# Local credentials
+mta_secrets.h
+*.local.h
+
+# Compiled firmware and build artifacts
+*.bin
+*.elf
+*.map
+*.hex
+*.uf2
+
+# Local build directories
+build/
+.build/
