@@ -1875,13 +1875,15 @@ void processEventDelivery() {
 // ============================================================
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include "mta_tls_ca.h"
 #include "mta_secrets.h"  // Local only; never commit real credentials.
 
 // Wi-Fi credentials and MTA_DEVICE_KEY come from mta_secrets.h.
 const char* MTA_HEARTBEAT_URL =
-  "http://192.168.1.106:8000/api/v1/device/heartbeat";
+  "https://api.wantpaytake.ru/api/v1/device/heartbeat";
 const char* MTA_DEVICE_ID = "MTA-001";
-const char* MTA_EVENTS_URL = "http://192.168.1.106:8000/api/v1/device/events";
+const char* MTA_EVENTS_URL = "https://api.wantpaytake.ru/api/v1/device/events";
 
 const unsigned long MTA_HEARTBEAT_INTERVAL_MS = 10000;
 const unsigned long MTA_WIFI_RETRY_MS = 10000;
@@ -1943,15 +1945,24 @@ void communicationTask(void* parameter) {
       continue;
     }
 
+    // TLS certificate verification needs valid system time from NTP.
+    // Do not dequeue events or send a heartbeat until the clock is ready.
+    if (time(nullptr) < 1700000000) {
+      vTaskDelay(pdMS_TO_TICKS(500));
+      continue;
+    }
+
     // One FIFO event request at a time. On failure the main loop retains it.
     EventSendRequest request = {};
     if (eventSendQueue && xQueueReceive(eventSendQueue, &request, 0) == pdTRUE) {
       EventSendResult result = {};
       snprintf(result.eventId, sizeof(result.eventId), "%s", request.eventId);
+      WiFiClientSecure eventTls;
+      eventTls.setCACert(MTA_TLS_ROOT_CA);
       HTTPClient eventHttp;
-      eventHttp.setConnectTimeout(1500);
-      eventHttp.setTimeout(1500);
-      if (eventHttp.begin(MTA_EVENTS_URL)) {
+      eventHttp.setConnectTimeout(6000);
+      eventHttp.setTimeout(6000);
+      if (eventHttp.begin(eventTls, MTA_EVENTS_URL)) {
         eventHttp.addHeader("Content-Type", "application/json");
         eventHttp.addHeader("X-MTA-Key", MTA_DEVICE_KEY);
         result.httpCode = eventHttp.POST(String(request.payload));
@@ -1968,10 +1979,12 @@ void communicationTask(void* parameter) {
     }
     if (xQueueReceive(heartbeatQueue, &snapshot, pdMS_TO_TICKS(250)) == pdTRUE) {
       Serial.printf("[MTA NET] Wi-Fi connected, IP=%s\n", WiFi.localIP().toString().c_str());
+      WiFiClientSecure heartbeatTls;
+      heartbeatTls.setCACert(MTA_TLS_ROOT_CA);
       HTTPClient http;
-      http.setConnectTimeout(1500);
-      http.setTimeout(1500);
-      if (http.begin(MTA_HEARTBEAT_URL)) {
+      http.setConnectTimeout(6000);
+      http.setTimeout(6000);
+      if (http.begin(heartbeatTls, MTA_HEARTBEAT_URL)) {
         http.addHeader("Content-Type", "application/json");
         http.addHeader("X-MTA-Key", MTA_DEVICE_KEY);
         String payload = String("{\"device_id\":\"") + MTA_DEVICE_ID +
