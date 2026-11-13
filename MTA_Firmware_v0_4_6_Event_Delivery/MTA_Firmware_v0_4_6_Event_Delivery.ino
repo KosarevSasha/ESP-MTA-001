@@ -1451,6 +1451,8 @@ QueueHandle_t eventResultQueue = nullptr;
 bool eventSendPending = false;
 uint32_t eventLastAttempt = 0;
 const uint32_t EVENT_RETRY_MS = 5000;
+// Diagnostic phase: never upload queued events until inventory is reconciled.
+const bool MTA_ENABLE_EVENT_UPLOAD = false;
 struct EventSendRequest { char payload[400]; char eventId[40]; };
 struct EventSendResult { char eventId[40]; int httpCode; bool accepted; };
 bool eventJournalReady = false;
@@ -1768,10 +1770,70 @@ void printReadinessDiagnostics() {
   Serial.println("[MTA DIAG] ==========================\n");
 }
 
+// One-time experimental accounting reset; requires two distinct serial commands.
+// Intentionally preserves NVS event sequence (global event IDs must never repeat).
+// PaymentManager preferences and Wi-Fi secrets are NOT touched.
+static bool accountingResetArmed = false;
+static uint32_t accountingResetArmedAt = 0;
+const uint32_t ACCOUNTING_RESET_WINDOW_MS = 10000;
+
+bool accountingResetAllowed() {
+  return !MTA_ENABLE_EVENT_UPLOAD && eventJournalReady && !eventSendPending &&
+         currentState == IDLE && !paymentSessionOpen &&
+         !paymentFaultLatch && !payment.uncertainFinancialResult() &&
+         payment.isIdle();
+}
+
+void resetExperimentalAccounting() {
+  accountingResetArmed = false;
+  if (!accountingResetAllowed()) {
+    Serial.println("[MTA RESET] REFUSED: machine not idle, payment pending, or event upload enabled");
+    return;
+  }
+  // Each acknowledgement persists its own position. A power loss may leave
+  // a PARTIAL reset; re-run Z then Y after checking the machine is safe.
+  while (eventCount > 0) {
+    StoredEvent ev = {};
+    if (!readEventAt(eventHead, ev) || !acknowledgeHead(ev.eventId)) {
+      Serial.println("[MTA RESET] STOPPED: journal could not be advanced");
+      return;
+    }
+  }
+  if (eventPrefs.putUShort("stock", 0) != sizeof(uint16_t)) {
+    Serial.println("[MTA RESET] ERROR: could not persist stock=0");
+    return;
+  }
+  localStock = eventPrefs.getUShort("stock", 65535);
+  if (localStock != 0) {
+    Serial.println("[MTA RESET] ERROR: stock readback failed");
+    return;
+  }
+  Serial.printf("[MTA RESET] COMPLETE: stock=0, pending=0, preserved seq=%lu (next=%lu)\\n",
+                (unsigned long)eventSequence, (unsigned long)(eventSequence + 1));
+  // Let the normal readiness state machine handle EMPTY on a later check.
+}
+
 void processEventTestCommands() {
   while (Serial.available() > 0) {
     const char command = (char)Serial.read();
-    if (command == 'P' || command == 'p') printReadinessDiagnostics();
+    if (accountingResetArmed &&
+        (uint32_t)(millis() - accountingResetArmedAt) > ACCOUNTING_RESET_WINDOW_MS) {
+      accountingResetArmed = false;
+      Serial.println("[MTA RESET] Confirmation expired");
+    }
+    if (command == 'Z') {
+      if (!accountingResetAllowed()) {
+        accountingResetArmed = false;
+        Serial.println("[MTA RESET] REFUSED: not safe to arm");
+      } else {
+        accountingResetArmed = true;
+        accountingResetArmedAt = millis();
+        Serial.println("[MTA RESET] ARMED for 10 s. Send capital Y to clear TEST stock and pending events; sequence preserved");
+      }
+    } else if (command == 'Y') {
+      if (accountingResetArmed) resetExperimentalAccounting();
+      else Serial.println("[MTA RESET] NOT ARMED; send capital Z first");
+    } else if (command == 'P' || command == 'p') printReadinessDiagnostics();
     else if (command == 'T' || command == 't') appendEvent("TEST", "serial-test");
     else if (command == 'L' || command == 'l') listEvents();
     else if (command == 'I' || command == 'i') Serial.printf("[MTA STOCK] Local stock=%u\n", localStock);
@@ -1884,10 +1946,6 @@ const char* MTA_HEARTBEAT_URL =
   "https://api.wantpaytake.ru/api/v1/device/heartbeat";
 const char* MTA_DEVICE_ID = "MTA-001";
 const char* MTA_EVENTS_URL = "https://api.wantpaytake.ru/api/v1/device/events";
-
-// Stage 1 safety: keep queued SALE/LOAD/ERROR events local until identifiers
-// and server inventory are verified. Heartbeat continues over HTTPS.
-const bool MTA_ENABLE_EVENT_UPLOAD = false;
 
 const unsigned long MTA_HEARTBEAT_INTERVAL_MS = 10000;
 const unsigned long MTA_WIFI_RETRY_MS = 10000;
