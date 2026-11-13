@@ -1808,7 +1808,7 @@ void resetExperimentalAccounting() {
     Serial.println("[MTA RESET] ERROR: stock readback failed");
     return;
   }
-  Serial.printf("[MTA RESET] COMPLETE: stock=0, pending=0, preserved seq=%lu (next=%lu)\\n",
+  Serial.printf("[MTA RESET] COMPLETE: stock=0, pending=0, preserved seq=%lu (next=%lu)\n",
                 (unsigned long)eventSequence, (unsigned long)(eventSequence + 1));
   // Let the normal readiness state machine handle EMPTY on a later check.
 }
