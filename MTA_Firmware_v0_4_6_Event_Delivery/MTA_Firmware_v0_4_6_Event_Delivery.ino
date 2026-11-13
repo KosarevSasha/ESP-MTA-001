@@ -1464,6 +1464,7 @@ uint32_t eventSequence = 0;
 // The initial 20 cans are a LOCAL test baseline, not an automatic server LOAD.
 const uint16_t MTA_INITIAL_STOCK = 20;
 const int MTA_TEST_PRICE = 1; // Test value in minor currency units; not a real tariff.
+const char* MTA_PRODUCT_ID = "DOBRY_COLA_025"; // Same ID as server inventory.
 uint16_t localStock = MTA_INITIAL_STOCK;
 const char* activeFault = "NONE";
 
@@ -1678,16 +1679,40 @@ void archiveLegacyTests() {
   archivePrefs.end();
 }
 
-// A real LOAD event for controlled testing. Quantity +1 affects server stock.
+// Diagnostic LOAD +1: journal first, then local stock. Delivery stays disabled.
+// The operator must load a physical can separately before any dispensing test.
 void saveDemoLoad() {
+  if (!eventJournalReady || MTA_ENABLE_EVENT_UPLOAD || eventSendPending ||
+      currentState != IDLE || paymentSessionOpen || paymentFaultLatch ||
+      payment.uncertainFinancialResult() || !payment.isIdle()) {
+    Serial.println("[MTA LOAD] REFUSED: not in safe diagnostic state"); return;
+  }
+  if (localStock == UINT16_MAX) {
+    Serial.println("[MTA LOAD] REFUSED: local stock overflow"); return;
+  }
   time_t now = time(nullptr);
   if (now < 1700000000) {
-    Serial.println("[MTA EVT] Clock not synchronized; LOAD not saved"); return;
+    Serial.println("[MTA LOAD] REFUSED: NTP clock not synchronized"); return;
   }
   char data[80];
-  snprintf(data, sizeof(data), "{\"product_id\":\"WATER_05\",\"quantity\":1,\"ts\":%lu}",
-           (unsigned long)now);
-  appendEvent("LOAD", data);
+  snprintf(data, sizeof(data), "{\"product_id\":\"%s\",\"quantity\":1,\"ts\":%lu}",
+           MTA_PRODUCT_ID, (unsigned long)now);
+  if (!appendEvent("LOAD", data)) {
+    Serial.println("[MTA LOAD] REFUSED: could not persist LOAD event"); return;
+  }
+  const uint16_t targetStock = localStock + 1;
+  if (eventPrefs.putUShort("stock", targetStock) != sizeof(uint16_t)) {
+    Serial.println("[MTA LOAD] CRITICAL: event saved but stock write failed; STOP TEST and reconcile manually");
+    return;
+  }
+  const uint16_t saved = eventPrefs.getUShort("stock", UINT16_MAX);
+  if (saved != targetStock) {
+    Serial.println("[MTA LOAD] CRITICAL: stock readback mismatch; STOP TEST and reconcile manually");
+    return;
+  }
+  localStock = saved;
+  Serial.printf("[MTA LOAD] SAVED product=%s quantity=1 local_stock=%u event_seq=%lu; upload disabled\n",
+                MTA_PRODUCT_ID, (unsigned)localStock, (unsigned long)eventSequence);
 }
 
 // Read-only NVS diagnostics. No changes to journal or partition table.
@@ -1902,15 +1927,15 @@ void processEventDelivery() {
     snprintf(req.payload, sizeof(req.payload),
              "{\"event_id\":\"%s\",\"device_id\":\"MTA-001\","
              "\"event_type\":\"LOAD\",\"created_at\":\"%s\","
-             "\"data\":{\"product_id\":\"WATER_05\",\"quantity\":1}}",
-             ev.eventId, iso);
+             "\"data\":{\"product_id\":\"%s\",\"quantity\":1}}",
+             ev.eventId, iso, MTA_PRODUCT_ID);
   } else if (isSale) {
     snprintf(req.payload, sizeof(req.payload),
              "{\"event_id\":\"%s\",\"device_id\":\"MTA-001\","
              "\"event_type\":\"SALE\",\"session_id\":\"%s\","
-             "\"created_at\":\"%s\",\"data\":{\"product_id\":\"WATER_05\","
+             "\"created_at\":\"%s\",\"data\":{\"product_id\":\"%s\","
              "\"price\":%d,\"payment\":\"SUCCESS\",\"dispense\":\"SUCCESS\"}}",
-             ev.eventId, ev.eventId, iso, MTA_TEST_PRICE);
+             ev.eventId, ev.eventId, iso, MTA_PRODUCT_ID, MTA_TEST_PRICE);
   } else {
     const char* code = strstr(ev.data, "\"code\":\"");
     if (!code) { Serial.println("[MTA EVT] Missing error code; retained"); return; }
