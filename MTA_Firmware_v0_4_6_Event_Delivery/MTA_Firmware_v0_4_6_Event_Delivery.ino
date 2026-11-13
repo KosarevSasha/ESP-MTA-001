@@ -1885,6 +1885,10 @@ const char* MTA_HEARTBEAT_URL =
 const char* MTA_DEVICE_ID = "MTA-001";
 const char* MTA_EVENTS_URL = "https://api.wantpaytake.ru/api/v1/device/events";
 
+// Stage 1 safety: keep queued SALE/LOAD/ERROR events local until identifiers
+// and server inventory are verified. Heartbeat continues over HTTPS.
+const bool MTA_ENABLE_EVENT_UPLOAD = false;
+
 const unsigned long MTA_HEARTBEAT_INTERVAL_MS = 10000;
 const unsigned long MTA_WIFI_RETRY_MS = 10000;
 
@@ -2395,7 +2399,7 @@ void setup() {
 void loop() {
 
   processEventTestCommands();
-  processEventDelivery();
+  if (MTA_ENABLE_EVENT_UPLOAD) processEventDelivery();
   processPayment();
   processInputs();
   processPayment();
