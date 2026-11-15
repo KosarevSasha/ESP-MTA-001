@@ -1809,6 +1809,13 @@ void saveDemoLoad() {
       payment.uncertainFinancialResult() || !payment.isIdle()) {
     Serial.println("[MTA LOAD] REFUSED: accounting or payment not safe"); return;
   }
+  // Only this test's single LOAD may be created: stock 1 -> 2, event #3.
+  // Never let an accidental extra D silently change experimental inventory.
+  if (localStock != 1 || eventCount != 0 || eventSequence != 2 ||
+      eventPrefs.isKey("stockop")) {
+    Serial.println("[MTA LOAD] REFUSED: v0.4.11 requires stock=1, empty journal and next sequence=3");
+    return;
+  }
   if (localStock == UINT16_MAX) {
     Serial.println("[MTA LOAD] REFUSED: stock overflow"); return;
   }
