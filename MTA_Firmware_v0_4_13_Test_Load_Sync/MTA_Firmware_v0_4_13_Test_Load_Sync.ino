@@ -1,9 +1,10 @@
 /*
   ============================================================
-  WANT!PAY!TAKE! MTA Firmware v0.4.12 - FIFO Event Delivery
+  WANT!PAY!TAKE! MTA Firmware v0.4.13 - Test LOAD + FIFO Delivery
   ============================================================
 
   Device: MTA-001 | Board: ESP32 Dev Module | EXPERIMENTAL
+  v0.4.13: guarded one-can SERVICE LOAD via D, NVS + FIFO delivery.
   v0.4.12: FIFO delivery of LOAD, SALE and error events; retry after offline.
   v0.4.11: guarded auto-retry for offline LOAD #3 only; no other auto delivery.
   v0.4.10: one-shot operator-triggered delivery of queued LOAD E0000000002.
