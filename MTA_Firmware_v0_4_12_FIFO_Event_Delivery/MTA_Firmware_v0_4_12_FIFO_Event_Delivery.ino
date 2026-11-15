@@ -1799,36 +1799,9 @@ void archiveLegacyTests() {
   archivePrefs.end();
 }
 
-// Diagnostic LOAD +1: power-loss-safe journal/stock accounting; upload OFF.
-// Physical loading is separate. No real payment/dispense tests at this stage.
+// Historical demo loading is disabled; future LOAD must be linked to Data Matrix.
 void saveDemoLoad() {
-  if (!eventJournalReady || !stockAccountingHealthy ||
-      eventSendPending || eventDeliveryBlocked ||
-      currentState != IDLE || paymentSessionOpen || paymentFaultLatch ||
-      payment.uncertainFinancialResult() || !payment.isIdle()) {
-    Serial.println("[MTA LOAD] REFUSED: accounting or payment not safe"); return;
-  }
-  // Test D is disabled in the operational event-delivery build:
-  // inventory must be loaded via an auditable operator workflow later.
-  Serial.println("[MTA LOAD] DISABLED: demo D is not an inventory operation");
-  return;
-  // Historical diagnostic LOAD code below intentionally unreachable.
-  if (localStock == UINT16_MAX) {
-    Serial.println("[MTA LOAD] REFUSED: stock overflow"); return;
-  }
-  time_t now = time(nullptr);
-  if (now < 1700000000) {
-    Serial.println("[MTA LOAD] REFUSED: time not synchronized"); return;
-  }
-  char data[80];
-  snprintf(data, sizeof(data), "{\"product_id\":\"%s\",\"quantity\":1,\"ts\":%lu}",
-           MTA_PRODUCT_ID, (unsigned long)now);
-  if (!appendStockEvent("LOAD", data, 1)) {
-    Serial.println("[MTA LOAD] CRITICAL: operation incomplete; do not repeat D");
-    return;
-  }
-  Serial.printf("[MTA LOAD] SAVED product=%s quantity=1 local_stock=%u event_seq=%lu; restricted offline delivery\n",
-                MTA_PRODUCT_ID, (unsigned)localStock, (unsigned long)eventSequence);
+  Serial.println("[MTA LOAD] D disabled. Load using documented inventory workflow.");
 }
 
 // Read-only NVS diagnostics. No changes to journal or partition table.
