@@ -2214,10 +2214,10 @@ void communicationTask(void* parameter) {
         if (result.httpCode == 200) {
           String response = eventHttp.getString();
           // Match the exact status and event ID; a generic substring is unsafe.
-          String idNeedle = String("\\"event_id\\":\\"") + request.eventId + "\\"";
+          String idNeedle = String("\"event_id\":\"") + request.eventId + "\"";
           bool matchId = response.indexOf(idNeedle) >= 0;
-          bool accepted = response.indexOf("\\"status\\":\\"accepted\\"") >= 0 ||
-                          response.indexOf("\\"status\\":\\"already_accepted\\"") >= 0;
+          bool accepted = response.indexOf("\"status\":\"accepted\"") >= 0 ||
+                          response.indexOf("\"status\":\"already_accepted\"") >= 0;
           result.accepted = matchId && accepted;
         }
         eventHttp.end();
