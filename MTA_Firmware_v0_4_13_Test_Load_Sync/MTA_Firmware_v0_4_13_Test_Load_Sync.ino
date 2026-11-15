@@ -1,0 +1,2668 @@
+/*
+  ============================================================
+  WANT!PAY!TAKE! MTA Firmware v0.4.12 - FIFO Event Delivery
+  ============================================================
+
+  Device: MTA-001 | Board: ESP32 Dev Module | EXPERIMENTAL
+  v0.4.12: FIFO delivery of LOAD, SALE and error events; retry after offline.
+  v0.4.11: guarded auto-retry for offline LOAD #3 only; no other auto delivery.
+  v0.4.10: one-shot operator-triggered delivery of queued LOAD E0000000002.
+  v0.4.9: NVS stock-operation intent + restart recovery.
+  Based on v0.4.6 Event Delivery (HTTPS + LOAD test).
+  NEW v0.3.10: per-device HTTP authorization via X-MTA-Key; local secrets header.
+  NEW v0.3.7: persistent NVS event journal + USB serial test commands.
+  NEW v0.3.8: FIFO HTTP event sender, NTP timestamps, explicit TEST archival.
+  NEW v0.3.6: Wi-Fi heartbeat in a separate FreeRTOS task.
+  Network work never runs in the mechanical control loop.
+
+  NEW v0.3.5:
+  - SERVICE_DISPENSING state
+  - Short GPIO17 press: normal service dispense after checks
+  - GPIO17 hold >= 3 s: forced service dispense
+  - 7 s timeout starts at actual motor start
+  - GPIO19/GPIO21 stop on a new valid event
+  - Already-active sensors must return normal before re-arming
+  - Re-press GPIO17 after release: manual STOP in forced mode
+  - Normal service stop returns directly to SERVICE
+  - Closing service door during SERVICE_DISPENSING -> ERROR
+
+  NOT IMPLEMENTED YET:
+  - Operator notifications
+  - Standalone TimerManager refactor (existing millis-based mechanics retained)
+*/
+
+#include <time.h>
+#include <cstring>
+#include <Preferences.h>
+#include "PaymentManager.h"
+
+// Forward declarations for Arduino IDE automatic function prototypes.
+struct StoredEvent;
+struct EventSendRequest;
+struct EventSendResult;
+struct HeartbeatSnapshot;
+bool appendStockEvent(const char* type, const char* data, int8_t delta);
+
+// ============================================================
+// MACHINE STATES
+// ============================================================
+
+enum MachineState {
+  IDLE,
+  WAIT_PAYMENT,
+  DISPENSING,
+  SUCCESS,
+  EMPTY,
+  SERVICE,
+  SERVICE_DISPENSING,
+  WAIT_CLEAR_DISPENSER,
+  WAIT_SHUTTER_CLOSE,
+  ERROR_STATE
+};
+
+
+// ============================================================
+// PIN MAP
+// ============================================================
+
+const int PIN_WANT_WINDOW      = 14;
+const int PIN_ARROW            = 22;
+const int PIN_WANT_BUTTON_LED  = 23;
+
+const int PIN_LED_READY        = 25;
+const int PIN_LED_DISPENSE     = 26;
+const int PIN_LED_TAKE         = 27;
+const int PIN_LED_EMPTY        = 32;
+const int PIN_LED_ERROR        = 33;
+
+const int PIN_WANT_BUTTON      = 18;
+
+const int PIN_TRAY_SENSOR      = 34;
+const int PIN_NEXT_CAN         = 35;
+const int PIN_CAN_EXIT         = 21;
+const int PIN_SHUTTER          = 19;
+const int PIN_SERVICE_DOOR     = 16;
+const int PIN_MANUAL_DISPENSE  = 17;
+
+const int PIN_MOTOR_RELAY      = 13;
+
+// GPIO39/15 are owned by PaymentManager UART2 (RX/TX).
+const int PIN_REFUND_LED       = 5;
+
+const int PIN_BUZZER           = 4;
+
+
+// ============================================================
+// CONFIGURATION
+// ============================================================
+
+const bool MOTOR_ENABLED = true;
+
+const unsigned long DISPENSE_TIMEOUT       = 7000;
+const unsigned long EMPTY_CHECK_TIMEOUT    = 15000;
+
+// NEW v0.3.4
+const unsigned long SHUTTER_RECOVERY_TIMEOUT = 15000;
+
+// NEW v0.3.5
+const unsigned long MANUAL_HOLD_TIMEOUT = 3000;
+
+
+// ============================================================
+// VERIFIED HARDWARE LEVELS
+// ============================================================
+
+const int TRAY_OCCUPIED_LEVEL    = LOW;
+const int NEXT_CAN_PRESENT_LEVEL = LOW;
+
+const int SERVICE_DOOR_OPEN_LEVEL = HIGH;
+
+const int SHUTTER_DOWN_LEVEL   = HIGH;
+const int SHUTTER_RAISED_LEVEL = LOW;
+
+const int CAN_EXIT_NORMAL_LEVEL  = LOW;
+const int CAN_EXIT_TRIGGER_LEVEL = HIGH;
+
+const int WANT_BUTTON_RELEASED_LEVEL = HIGH;
+const int WANT_BUTTON_PRESSED_LEVEL  = LOW;
+
+const int MANUAL_BUTTON_RELEASED_LEVEL = HIGH;
+const int MANUAL_BUTTON_PRESSED_LEVEL  = LOW;
+
+
+// ============================================================
+// DEBOUNCED INPUT
+// ============================================================
+
+struct DebouncedInput {
+  int pin;
+  int stableState;
+  int lastRawState;
+  unsigned long lastChangeTime;
+};
+
+const unsigned long DEBOUNCE_TIME = 40;
+
+DebouncedInput wantButton;
+DebouncedInput manualDispense;
+DebouncedInput shutter;
+DebouncedInput serviceDoor;
+DebouncedInput canExit;
+DebouncedInput traySensor;
+
+
+// ============================================================
+// GLOBAL STATE
+// ============================================================
+
+MachineState currentState = ERROR_STATE;
+
+
+// Context for WAIT_CLEAR_DISPENSER
+
+MachineState returnStateAfterClear = IDLE;
+
+
+// NEW v0.3.4
+// Context for WAIT_SHUTTER_CLOSE
+
+MachineState returnStateAfterShutter = IDLE;
+
+
+// ============================================================
+// TIMERS
+// ============================================================
+
+unsigned long dispenseStartTime = 0;
+unsigned long emptyCheckStartTime = 0;
+
+// NEW v0.3.4
+unsigned long shutterRecoveryStartTime = 0;
+
+// NEW v0.3.5
+unsigned long manualPressStartTime = 0;
+
+
+// ============================================================
+// DISPENSE DATA
+// ============================================================
+
+bool exitSeen    = false;
+bool shutterSeen = false;
+bool traySeen    = false;
+
+bool motorRunning = false;
+
+bool refundRequested = false;
+
+// Integration context. PaymentManager owns protocol; StateManager owns machine transitions.
+enum class PaidOutcome : uint8_t { NONE, DISPENSED, NOT_DISPENSED, UNKNOWN };
+PaidOutcome paidOutcome = PaidOutcome::NONE;
+bool paymentApproved = false;
+bool paymentCycleFinished = true;
+bool paymentSaleAccepted = false;
+bool paymentFaultLatch = false;
+bool paymentSessionOpen = false;
+bool paymentNvsReady = false;
+Preferences paymentPrefs;
+HardwareSerial vendistaUart(2);
+PaymentManager payment(vendistaUart);
+PaymentManager::Timer paymentTimer = PaymentManager::Timer::NONE;
+uint32_t paymentTimerStartedAt = 0;
+uint32_t paymentTimerDuration = 0;
+// A test price of 1 RUB (100 kopecks), independently from server-test event price.
+const uint32_t MTA_PRICE_KOPECKS = 100;
+const uint16_t MTA_HUMAN_ITEM = 2;
+// Wi-Fi only A/B test: disable existing CommunicationManager HTTP task and queues.
+const bool MTA_ENABLE_NETWORK_TASK = true;
+uint32_t paymentLastPollAt = 0;
+uint32_t paymentMaxPollGapMs = 0;
+uint32_t paymentMaxUpdateCostUs = 0;
+
+
+// ============================================================
+// SERVICE DISPENSE DATA - NEW v0.3.5
+// ============================================================
+
+bool serviceDispenseForced = false;
+bool serviceExitArmed = false;
+bool serviceShutterArmed = false;
+bool serviceStopArmed = false;
+bool manualPressPending = false;
+
+
+// ============================================================
+// FORWARD DECLARATIONS
+// ============================================================
+
+void runReadinessCheck(MachineState requestedState);
+void checkDispenseSuccess();
+void recordStateTransition(MachineState oldState, MachineState newState);
+bool appendEvent(const char* type, const char* data);
+void startPaidSession();
+void paymentStateChanged(MachineState previousState, MachineState nextState);
+void processPayment();
+void beginConfirmedNonDelivery();
+void markUncertainOutcome(const char* reason);
+void printPaymentDiagnostics();
+void clearPaymentInterlock();
+const char* stateNameForServer(MachineState state);
+
+
+// ============================================================
+// SENSOR SEMANTICS
+// ============================================================
+
+bool trayOccupied() {
+  return digitalRead(PIN_TRAY_SENSOR)
+         == TRAY_OCCUPIED_LEVEL;
+}
+
+
+bool nextCanPresent() {
+  return digitalRead(PIN_NEXT_CAN)
+         == NEXT_CAN_PRESENT_LEVEL;
+}
+
+
+bool serviceDoorOpen() {
+  return digitalRead(PIN_SERVICE_DOOR)
+         == SERVICE_DOOR_OPEN_LEVEL;
+}
+
+
+bool shutterRaised() {
+  return digitalRead(PIN_SHUTTER)
+         == SHUTTER_RAISED_LEVEL;
+}
+
+
+bool canExitAbnormal() {
+  return digitalRead(PIN_CAN_EXIT)
+         != CAN_EXIT_NORMAL_LEVEL;
+}
+
+
+// ============================================================
+// OUTPUT MANAGER
+// ============================================================
+
+void motorOff() {
+  digitalWrite(PIN_MOTOR_RELAY, LOW);
+  motorRunning = false;
+}
+
+
+void motorOn() {
+
+  if (!MOTOR_ENABLED) {
+    motorOff();
+    return;
+  }
+
+  digitalWrite(PIN_MOTOR_RELAY, HIGH);
+  motorRunning = true;
+}
+
+
+void refundOff() {
+  refundRequested = false;
+  digitalWrite(PIN_REFUND_LED, LOW);
+}
+
+
+void requestRefund() {
+  refundRequested = true;
+  digitalWrite(PIN_REFUND_LED, HIGH);
+}
+
+
+void allCustomerIndicatorsOff() {
+
+  digitalWrite(PIN_WANT_WINDOW, LOW);
+  digitalWrite(PIN_ARROW, LOW);
+  digitalWrite(PIN_WANT_BUTTON_LED, LOW);
+
+  digitalWrite(PIN_LED_READY, LOW);
+  digitalWrite(PIN_LED_DISPENSE, LOW);
+  digitalWrite(PIN_LED_TAKE, LOW);
+  digitalWrite(PIN_LED_EMPTY, LOW);
+  digitalWrite(PIN_LED_ERROR, LOW);
+}
+
+
+void applyStateOutputs(MachineState state) {
+
+  // Safe defaults
+
+  motorOff();
+  digitalWrite(PIN_BUZZER, LOW);
+
+  allCustomerIndicatorsOff();
+
+
+  switch (state) {
+
+    case IDLE:
+
+      refundOff();
+
+      digitalWrite(PIN_WANT_WINDOW, HIGH);
+      digitalWrite(PIN_WANT_BUTTON_LED, HIGH);
+      digitalWrite(PIN_LED_READY, HIGH);
+
+      break;
+
+
+    case WAIT_PAYMENT:
+
+      refundOff();
+
+      digitalWrite(PIN_ARROW, HIGH);
+
+      break;
+
+
+    case DISPENSING:
+
+      digitalWrite(PIN_LED_DISPENSE, HIGH);
+      motorOn();
+
+      break;
+
+
+    case SUCCESS:
+
+      digitalWrite(PIN_LED_TAKE, HIGH);
+
+      break;
+
+
+    case EMPTY:
+
+      digitalWrite(PIN_LED_EMPTY, HIGH);
+
+      break;
+
+
+    case SERVICE:
+
+      // Customer indicators OFF.
+      // Shutter manipulation allowed.
+
+      break;
+
+
+    case SERVICE_DISPENSING:
+
+      // Customer indicators OFF.
+      // Motor starts explicitly in startServiceDispense().
+
+      break;
+
+
+    case WAIT_CLEAR_DISPENSER:
+
+      // White "Take can"
+
+      digitalWrite(PIN_LED_TAKE, HIGH);
+
+      break;
+
+
+    case WAIT_SHUTTER_CLOSE:
+
+      // Protective warning
+
+      digitalWrite(PIN_LED_ERROR, HIGH);
+      digitalWrite(PIN_BUZZER, HIGH);
+
+      break;
+
+
+    case ERROR_STATE:
+
+      digitalWrite(PIN_LED_ERROR, HIGH);
+
+      break;
+  }
+}
+
+
+// ============================================================
+// STATE MANAGER
+// ============================================================
+
+void changeState(MachineState newState) {
+
+  if (newState == DISPENSING && (!paymentApproved || paidOutcome != PaidOutcome::NONE || paymentFaultLatch)) {
+    Serial.println("[MTA PAY] DISPENSING blocked without valid authorization");
+    newState = ERROR_STATE;
+  }
+  if (newState == WAIT_PAYMENT && (!paymentSessionOpen || paymentFaultLatch)) {
+    Serial.println("[MTA PAY] WAIT_PAYMENT blocked without active session");
+    newState = ERROR_STATE;
+  }
+  if (newState == IDLE && (paymentFaultLatch || paymentSessionOpen || !paymentCycleFinished)) {
+    Serial.println("[MTA PAY] IDLE blocked: unresolved payment/session");
+    newState = ERROR_STATE;
+  }
+  if (currentState == newState) {
+    return;
+  }
+
+  MachineState previousState = currentState;
+  currentState = newState;
+  recordStateTransition(previousState, newState);
+
+
+  if (newState == DISPENSING) {
+
+    exitSeen    = false;
+    shutterSeen = false;
+    traySeen    = false;
+
+    dispenseStartTime = millis();
+  }
+
+
+  if (newState == EMPTY) {
+
+    emptyCheckStartTime = millis();
+  }
+
+
+  // NEW v0.3.4
+  //
+  // 15-second timer starts ONLY when entering
+  // WAIT_SHUTTER_CLOSE.
+  //
+  // It is not restarted while remaining in that state.
+
+  if (newState == WAIT_SHUTTER_CLOSE) {
+
+    shutterRecoveryStartTime = millis();
+  }
+
+
+  applyStateOutputs(currentState);
+  paymentStateChanged(previousState, currentState);
+}
+
+
+// ============================================================
+// WAIT_CLEAR_DISPENSER ENTRY
+// ============================================================
+
+void enterWaitClearDispenser(
+  MachineState returnState
+) {
+
+  returnStateAfterClear = returnState;
+
+  changeState(WAIT_CLEAR_DISPENSER);
+}
+
+
+// ============================================================
+// WAIT_SHUTTER_CLOSE ENTRY
+// ============================================================
+
+void enterWaitShutterClose(
+  MachineState returnState
+) {
+
+  returnStateAfterShutter = returnState;
+
+  changeState(WAIT_SHUTTER_CLOSE);
+}
+
+
+// ============================================================
+// SERVICE DISPENSE MANAGER - NEW v0.3.5
+// ============================================================
+
+void finishServiceDispense() {
+
+  motorOff();
+
+  serviceDispenseForced = false;
+  serviceExitArmed = false;
+  serviceShutterArmed = false;
+  serviceStopArmed = false;
+
+  changeState(SERVICE);
+}
+
+
+void startServiceDispense(bool forced) {
+  if (paymentFaultLatch || paymentSessionOpen) {
+    Serial.println("[MTA PAY] Service dispense blocked while payment unresolved");
+    return;
+  }
+
+  // Service dispense is legal only with service door open.
+  if (!serviceDoorOpen()) {
+    changeState(ERROR_STATE);
+    return;
+  }
+
+  // Normal service dispense requires the four agreed
+  // pre-start conditions. Forced mode bypasses them.
+  if (!forced) {
+
+    if (!nextCanPresent() ||
+        shutterRaised() ||
+        canExitAbnormal() ||
+        trayOccupied()) {
+
+      return;
+    }
+  }
+
+  serviceDispenseForced = forced;
+
+  // If a sensor is already active at forced start, it is not
+  // armed. It must first return to normal; only its NEXT
+  // activation may stop the motor.
+  serviceExitArmed =
+    !forced || !canExitAbnormal();
+
+  serviceShutterArmed =
+    !forced || !shutterRaised();
+
+  // In forced mode the starting long press is still held.
+  // Manual STOP becomes armed only after that press is released.
+  serviceStopArmed = !forced;
+
+  changeState(SERVICE_DISPENSING);
+
+  // Seven seconds are counted from actual motor start.
+  dispenseStartTime = millis();
+  motorOn();
+}
+
+
+void processManualHoldTimer() {
+
+  if (currentState != SERVICE) {
+    return;
+  }
+
+  if (!manualPressPending) {
+    return;
+  }
+
+  if (manualDispense.stableState
+      != MANUAL_BUTTON_PRESSED_LEVEL) {
+    return;
+  }
+
+  if ((millis() - manualPressStartTime)
+      < MANUAL_HOLD_TIMEOUT) {
+    return;
+  }
+
+  // Long press recognized. Its later release must not be
+  // interpreted as a short press.
+  manualPressPending = false;
+
+  startServiceDispense(true);
+}
+
+
+void processServiceDispenseTimeout() {
+
+  if (currentState != SERVICE_DISPENSING) {
+    return;
+  }
+
+  if ((millis() - dispenseStartTime)
+      < DISPENSE_TIMEOUT) {
+    return;
+  }
+
+  // Service timeout is deliberately simple:
+  // MOTOR OFF -> SERVICE. No ERROR.
+  finishServiceDispense();
+}
+
+
+// ============================================================
+// DISPENSE MANAGER
+// ============================================================
+
+void checkDispenseSuccess() {
+
+  if (currentState != DISPENSING) {
+    return;
+  }
+
+
+  if (shutterSeen && traySeen) {
+
+    motorOff();
+
+    changeState(SUCCESS);
+  }
+}
+
+
+// ============================================================
+// DISPENSE TIMEOUT
+// ============================================================
+
+void processDispenseTimeout() {
+
+  if (currentState != DISPENSING) {
+    return;
+  }
+
+
+  if ((millis() - dispenseStartTime)
+      < DISPENSE_TIMEOUT) {
+    return;
+  }
+
+
+  motorOff();
+
+
+  // Final physical check
+
+  if (shutterRaised()) {
+    shutterSeen = true;
+  }
+
+  if (trayOccupied()) {
+    traySeen = true;
+  }
+
+
+  // Product confirmed
+
+  if (shutterSeen && traySeen) {
+
+    changeState(SUCCESS);
+
+    return;
+  }
+
+
+  // Product passed mechanism,
+  // but tray not confirmed.
+  // No refund.
+
+  if (shutterSeen && !traySeen) {
+
+    markUncertainOutcome("SHUTTER_SEEN_TRAY_NOT_SEEN");
+    changeState(ERROR_STATE);
+
+    return;
+  }
+
+
+  // Product passage not confirmed.
+  // Refund.
+
+  if (!shutterSeen) {
+
+    beginConfirmedNonDelivery();
+    changeState(ERROR_STATE);
+
+    return;
+  }
+}
+
+
+// ============================================================
+// EMPTY TIMER
+// ============================================================
+
+void processEmptyTimer() {
+
+  if (currentState != EMPTY) {
+    return;
+  }
+
+
+  if ((millis() - emptyCheckStartTime)
+      < EMPTY_CHECK_TIMEOUT) {
+    return;
+  }
+
+
+  emptyCheckStartTime = millis();
+
+
+  if (!nextCanPresent()) {
+    return;
+  }
+
+
+  runReadinessCheck(IDLE);
+}
+
+
+// ============================================================
+// NEW v0.3.4
+// SHUTTER RECOVERY TIMER
+// ============================================================
+
+void processShutterRecoveryTimer() {
+
+  if (currentState != WAIT_SHUTTER_CLOSE) {
+    return;
+  }
+
+
+  if ((millis() - shutterRecoveryStartTime)
+      < SHUTTER_RECOVERY_TIMEOUT) {
+    return;
+  }
+
+
+  // 15 seconds elapsed.
+  //
+  // If shutter has physically returned to normal,
+  // do not create an ERROR merely because a debounced
+  // edge has not yet been processed.
+
+  if (!shutterRaised()) {
+
+    MachineState targetState =
+      returnStateAfterShutter;
+
+    runReadinessCheck(targetState);
+
+    return;
+  }
+
+
+  // Shutter still raised after 15 seconds.
+  //
+  // applyStateOutputs(ERROR_STATE) will switch buzzer OFF
+  // and leave red ERROR LED ON.
+  //
+  // Future:
+  // JournalManager -> one journal event
+  // Communications -> one operator notification
+
+  changeState(ERROR_STATE);
+}
+
+
+// ============================================================
+// READINESS CHECK
+// ============================================================
+
+void runReadinessCheck(
+  MachineState requestedState
+) {
+
+  /*
+      PRIORITY:
+
+      1. Service door
+      2. Shutter
+      3. Can exit limit switch
+      4. Next can
+      5. Tray
+      6. Requested state
+  */
+
+
+  // ----------------------------------------------------------
+  // 1. SERVICE DOOR
+  // ----------------------------------------------------------
+
+  if (serviceDoorOpen()) {
+
+    changeState(SERVICE);
+
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // 2. SHUTTER
+  // ----------------------------------------------------------
+
+  if (shutterRaised()) {
+
+    /*
+       If readiness discovers an open shutter,
+       enter protective recovery state.
+
+       IMPORTANT:
+       requestedState becomes the context to which
+       we will try to return after recovery.
+    */
+
+    enterWaitShutterClose(
+      requestedState
+    );
+
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // 3. CAN EXIT
+  // ----------------------------------------------------------
+
+  if (canExitAbnormal()) {
+
+    changeState(ERROR_STATE);
+
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // 4. NEXT CAN
+  // ----------------------------------------------------------
+
+  if (!nextCanPresent()) {
+
+    changeState(EMPTY);
+
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // 5. TRAY
+  // ----------------------------------------------------------
+
+  if (trayOccupied()) {
+
+    enterWaitClearDispenser(
+      requestedState
+    );
+
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // 6. EVERYTHING OK
+  // ----------------------------------------------------------
+
+  changeState(requestedState);
+}
+
+
+// ============================================================
+// DEBOUNCE
+// ============================================================
+
+void initDebouncedInput(
+  DebouncedInput &input,
+  int pin
+) {
+
+  input.pin = pin;
+
+  int value = digitalRead(pin);
+
+  input.stableState = value;
+  input.lastRawState = value;
+
+  input.lastChangeTime = millis();
+}
+
+
+bool updateDebouncedInput(
+  DebouncedInput &input,
+  int &oldStableState
+) {
+
+  int rawState = digitalRead(input.pin);
+
+
+  if (rawState != input.lastRawState) {
+
+    input.lastRawState = rawState;
+    input.lastChangeTime = millis();
+  }
+
+
+  if ((millis() - input.lastChangeTime)
+      >= DEBOUNCE_TIME) {
+
+    if (input.stableState != rawState) {
+
+      oldStableState = input.stableState;
+      input.stableState = rawState;
+
+      return true;
+    }
+  }
+
+
+  return false;
+}
+
+
+// ============================================================
+// INPUT PROCESSING
+// ============================================================
+
+void processInputs() {
+
+  int oldState;
+
+
+  // ==========================================================
+  // SERVICE DOOR
+  // ==========================================================
+
+  if (updateDebouncedInput(
+        serviceDoor,
+        oldState
+      )) {
+
+    if (serviceDoor.stableState
+        == SERVICE_DOOR_OPEN_LEVEL) {
+
+
+      // Service door has highest priority.
+      //
+      // Opening it from WAIT_SHUTTER_CLOSE
+      // immediately ends the alarm because SERVICE
+      // outputs have buzzer OFF.
+
+      if (currentState == IDLE ||
+          currentState == EMPTY ||
+          currentState == ERROR_STATE ||
+          currentState == WAIT_CLEAR_DISPENSER ||
+          currentState == WAIT_SHUTTER_CLOSE) {
+
+        changeState(SERVICE);
+
+      }
+
+      else if (currentState == SERVICE_DISPENSING) {
+
+        // A service cycle already requires the door to be open.
+        // If an OPEN edge is nevertheless received, stop safely
+        // and return to SERVICE.
+        motorOff();
+        changeState(SERVICE);
+      }
+
+      else if (currentState != SERVICE) {
+
+        changeState(ERROR_STATE);
+      }
+
+    }
+
+    else {
+
+      // Door closed after servicing.
+      //
+      // Start a completely new readiness check.
+
+      if (currentState == SERVICE_DISPENSING) {
+
+        // Closing the service door during active service
+        // dispensing is an abnormal termination.
+        motorOff();
+        changeState(ERROR_STATE);
+      }
+
+      else if (currentState == SERVICE) {
+
+        runReadinessCheck(IDLE);
+      }
+    }
+  }
+
+
+  // ==========================================================
+  // SHUTTER
+  // ==========================================================
+
+  if (updateDebouncedInput(
+        shutter,
+        oldState
+      )) {
+
+
+    // ---------------------------------------------------------
+    // SHUTTER RAISED
+    // ---------------------------------------------------------
+
+    if (shutter.stableState
+        == SHUTTER_RAISED_LEVEL) {
+
+
+      // =======================================================
+      // DISPENSING
+      //
+      // Expected event.
+      // =======================================================
+
+      if (currentState == DISPENSING) {
+
+        shutterSeen = true;
+
+        motorOff();
+
+        checkDispenseSuccess();
+      }
+
+
+      // =======================================================
+      // SERVICE
+      //
+      // Allowed.
+      // Technician may manipulate shutter.
+      // =======================================================
+
+      else if (currentState == SERVICE_DISPENSING) {
+
+        if (serviceShutterArmed) {
+          finishServiceDispense();
+        }
+      }
+
+
+      else if (currentState == SERVICE) {
+
+        // No action.
+      }
+
+
+      // =======================================================
+      // ERROR
+      //
+      // ERROR is already blocking.
+      // Do not replace it.
+      // =======================================================
+
+      else if (currentState == ERROR_STATE) {
+
+        // No action.
+      }
+
+
+      // =======================================================
+      // WAIT_SHUTTER_CLOSE
+      //
+      // Already handling this event.
+      // Do not restart timer.
+      // =======================================================
+
+      else if (currentState
+               == WAIT_SHUTTER_CLOSE) {
+
+        // No action.
+      }
+
+
+      // =======================================================
+      // WAIT_CLEAR_DISPENSER
+      //
+      // Shutter protection has higher priority.
+      //
+      // IMPORTANT:
+      // Do NOT overwrite returnStateAfterClear.
+      //
+      // returnStateAfterShutter is set to the ORIGINAL
+      // destination stored by WAIT_CLEAR_DISPENSER.
+      // =======================================================
+
+      else if (currentState
+               == WAIT_CLEAR_DISPENSER) {
+
+        enterWaitShutterClose(
+          returnStateAfterClear
+        );
+      }
+
+
+      // =======================================================
+      // ALL OTHER STATES
+      //
+      // IDLE
+      // WAIT_PAYMENT
+      // SUCCESS
+      // EMPTY
+      //
+      // Shutter opening is abnormal.
+      // =======================================================
+
+      else {
+
+        enterWaitShutterClose(
+          currentState
+        );
+      }
+    }
+
+
+    // ---------------------------------------------------------
+    // SHUTTER LOWERED
+    // ---------------------------------------------------------
+
+    else {
+
+
+      if (currentState == SERVICE_DISPENSING &&
+          serviceDispenseForced) {
+
+        // DOWN only re-arms a shutter that was already raised
+        // at forced start. DOWN itself never stops the motor.
+        serviceShutterArmed = true;
+      }
+
+
+      else if (currentState
+          == WAIT_SHUTTER_CLOSE) {
+
+        MachineState targetState =
+          returnStateAfterShutter;
+
+
+        // Do NOT blindly restore state.
+        //
+        // Full physical readiness check decides
+        // what is actually possible now.
+
+        runReadinessCheck(
+          targetState
+        );
+      }
+    }
+  }
+
+
+  // ==========================================================
+  // CAN EXIT
+  // ==========================================================
+
+  if (updateDebouncedInput(
+        canExit,
+        oldState
+      )) {
+
+    if (canExit.stableState
+        == CAN_EXIT_TRIGGER_LEVEL) {
+
+      if (currentState == DISPENSING) {
+
+        exitSeen = true;
+
+        motorOff();
+      }
+
+
+      else if (currentState == SERVICE_DISPENSING) {
+
+        if (serviceExitArmed) {
+          finishServiceDispense();
+        }
+      }
+    }
+
+    else {
+
+      if (currentState == SERVICE_DISPENSING &&
+          serviceDispenseForced) {
+
+        // NORMAL only re-arms GPIO21 if it was already active
+        // at forced start. NORMAL itself does not stop motor.
+        serviceExitArmed = true;
+      }
+    }
+  }
+
+
+  // ==========================================================
+  // TRAY SENSOR
+  // ==========================================================
+
+  if (updateDebouncedInput(
+        traySensor,
+        oldState
+      )) {
+
+
+    // ---------------------------------------------------------
+    // TRAY OCCUPIED
+    // ---------------------------------------------------------
+
+    if (traySensor.stableState
+        == TRAY_OCCUPIED_LEVEL) {
+
+
+      if (currentState == DISPENSING) {
+
+        traySeen = true;
+
+        checkDispenseSuccess();
+      }
+
+
+      else if (currentState == IDLE) {
+
+        enterWaitClearDispenser(
+          IDLE
+        );
+      }
+
+
+      else if (currentState
+               == WAIT_PAYMENT) {
+
+        enterWaitClearDispenser(
+          WAIT_PAYMENT
+        );
+      }
+
+
+      /*
+         SUCCESS:
+             occupied tray expected
+
+         SERVICE:
+             allowed
+
+         EMPTY:
+             EMPTY retained
+
+         WAIT_CLEAR_DISPENSER:
+             already waiting
+
+         WAIT_SHUTTER_CLOSE:
+             higher-priority shutter condition retained
+
+         ERROR:
+             retained
+      */
+    }
+
+
+    // ---------------------------------------------------------
+    // TRAY CLEAR
+    // ---------------------------------------------------------
+
+    else {
+
+
+      if (currentState == SUCCESS) {
+
+        if (paymentCycleFinished && paymentSaleAccepted && !paymentFaultLatch)
+          runReadinessCheck(IDLE);
+        else Serial.println("[MTA PAY] Tray clear; waiting for payment cycle completion");
+      }
+
+
+      else if (currentState
+               == WAIT_CLEAR_DISPENSER) {
+
+        MachineState targetState =
+          returnStateAfterClear;
+
+        returnStateAfterClear = IDLE;
+
+        runReadinessCheck(
+          targetState
+        );
+      }
+
+
+      // If tray clears while WAIT_SHUTTER_CLOSE is active,
+      // do nothing.
+      //
+      // Shutter protection remains dominant.
+      // When shutter closes, full readiness check will see
+      // the actual tray state.
+    }
+  }
+
+
+  // ==========================================================
+  // MANUAL SERVICE DISPENSE BUTTON - NEW v0.3.5
+  // ==========================================================
+
+  if (updateDebouncedInput(
+        manualDispense,
+        oldState
+      )) {
+
+    // ---------------------------------------------------------
+    // BUTTON PRESSED
+    // ---------------------------------------------------------
+
+    if (manualDispense.stableState
+        == MANUAL_BUTTON_PRESSED_LEVEL) {
+
+      if (currentState == SERVICE) {
+
+        // Do not start motor yet. First determine whether this
+        // is a short press or a >=3 s forced command.
+        manualPressPending = true;
+        manualPressStartTime = millis();
+      }
+
+      else if (currentState == SERVICE_DISPENSING &&
+               serviceDispenseForced &&
+               serviceStopArmed) {
+
+        // New press after release = immediate manual STOP.
+        finishServiceDispense();
+      }
+    }
+
+
+    // ---------------------------------------------------------
+    // BUTTON RELEASED
+    // ---------------------------------------------------------
+
+    else {
+
+      if (currentState == SERVICE &&
+          manualPressPending) {
+
+        unsigned long pressDuration =
+          millis() - manualPressStartTime;
+
+        manualPressPending = false;
+
+        if (pressDuration < MANUAL_HOLD_TIMEOUT) {
+
+          // Short press -> normal service dispense.
+          startServiceDispense(false);
+        }
+
+        else {
+
+          // Defensive fallback: normally the hold timer starts
+          // forced dispense exactly at 3 s while still pressed.
+          startServiceDispense(true);
+        }
+      }
+
+      else if (currentState == SERVICE_DISPENSING &&
+               serviceDispenseForced) {
+
+        // Starting long press has now been released.
+        // The NEXT new press may act as manual STOP.
+        serviceStopArmed = true;
+      }
+    }
+  }
+
+
+  // ==========================================================
+  // WANT BUTTON
+  // ==========================================================
+
+  if (updateDebouncedInput(
+        wantButton,
+        oldState
+      )) {
+
+    if (wantButton.stableState
+        == WANT_BUTTON_PRESSED_LEVEL) {
+
+      if (currentState == IDLE) {
+
+        startPaidSession();
+      }
+    }
+  }
+
+
+  // Payment simulator GPIO inputs have been replaced with PaymentManager events.
+
+}
+
+
+
+
+// ============================================================
+// EVENT MANAGER (v0.3.7, phase 1)
+// NVS journal. Fixed 64-record capacity. No overwrite on full.
+// Records are retained after reboot; delivery only after HTTP 200 confirmation.
+// Serial Monitor commands: T = add test event, L = list events.
+// ============================================================
+#include <Preferences.h>
+#include <nvs.h>
+#include <nvs_flash.h>
+#include <esp_partition.h>
+#include <time.h>
+#include <cstring>
+#include <cstdlib>
+
+const uint16_t MTA_EVENT_CAPACITY = 64;
+const uint32_t MTA_EVENT_MAGIC = 0x4D544137UL;
+
+struct StoredEvent {
+  uint32_t magic;
+  uint32_t sequence;
+  char eventId[40];
+  char eventType[20];
+  char data[80];
+};
+
+Preferences eventPrefs;
+Preferences archivePrefs;
+QueueHandle_t eventSendQueue = nullptr;
+QueueHandle_t eventResultQueue = nullptr;
+bool eventSendPending = false;
+uint32_t eventLastAttempt = 0;
+const uint32_t EVENT_RETRY_MS = 5000;
+// FIFO delivery is enabled for supported operational events. Test events stay local.
+const bool MTA_ENABLE_EVENT_UPLOAD = true;
+bool eventDeliveryBlocked = false;
+struct EventSendRequest { char payload[400]; char eventId[40]; };
+struct EventSendResult { char eventId[40]; int httpCode; bool accepted; };
+bool eventJournalReady = false;
+uint16_t eventHead = 0;
+uint16_t eventCount = 0;
+uint32_t eventSequence = 0;
+
+// v0.3.9 MVP: local count is persisted separately from the event queue.
+// The initial 20 cans are a LOCAL test baseline, not an automatic server LOAD.
+const uint16_t MTA_INITIAL_STOCK = 20;
+// SALE price is serialized from MTA_PRICE_KOPECKS (same amount as payment command).
+const char* MTA_PRODUCT_ID = "DOBRY_COLA_025"; // Same ID as server inventory.
+uint16_t localStock = MTA_INITIAL_STOCK;
+const char* activeFault = "NONE";
+
+// One durable intent per pending stock transaction; persisted as one NVS blob.
+// Old firmware events (including E0000000002) have no intent and remain intact.
+const uint32_t MTA_STOCK_OP_MAGIC = 0x53544F50UL;
+struct StockOperation {
+  uint32_t magic;
+  uint32_t sequence;
+  uint16_t oldStock;
+  uint16_t newStock;
+  char eventType[12];
+};
+bool stockAccountingHealthy = true;
+
+void initializeLocalStock() {
+  if (!eventJournalReady) return;
+  if (!eventPrefs.isKey("stock")) {
+    if (eventPrefs.putUShort("stock", MTA_INITIAL_STOCK) != sizeof(uint16_t)) {
+      Serial.println("[MTA STOCK] ERROR: cannot initialize stock");
+      return;
+    }
+  }
+  localStock = eventPrefs.getUShort("stock", MTA_INITIAL_STOCK);
+  Serial.printf("[MTA STOCK] Local stock=%u (server must be synchronized separately)\n", localStock);
+}
+
+void recordStateTransition(MachineState oldState, MachineState newState) {
+  // Only normal paid dispensing counts as a sale. Service dispense is excluded.
+  if (oldState == DISPENSING && newState == SUCCESS) {
+    if (localStock == 0) {
+      Serial.println("[MTA STOCK] CRITICAL: physical sale but local stock is zero");
+      return;
+    }
+    time_t now = time(nullptr);
+    char data[80];
+    snprintf(data, sizeof(data), "{\"ts\":%lu}", (unsigned long)(now >= 1700000000 ? now : 0));
+    if (appendStockEvent("SALE", data, -1))
+      Serial.printf("[MTA STOCK] SALE saved; local stock=%u\n", localStock);
+    else Serial.println("[MTA STOCK] CRITICAL: SALE accounting incomplete; block new sessions");
+  }
+  if (newState == ERROR_STATE && oldState != ERROR_STATE) {
+    const char* fault = (oldState == DISPENSING) ? "DISPENSE_FAILURE" : "UNCLASSIFIED_ERROR";
+    activeFault = fault;
+    time_t now = time(nullptr);
+    char data[80];
+    snprintf(data, sizeof(data), "{\"ts\":%lu,\"code\":\"%s\"}",
+             (unsigned long)(now >= 1700000000 ? now : 0), fault);
+    if (!appendEvent("ERROR_SET", data)) Serial.println("[MTA EVT] CRITICAL: error not journaled");
+  } else if (oldState == ERROR_STATE && newState != ERROR_STATE && strcmp(activeFault, "NONE") != 0) {
+    time_t now = time(nullptr);
+    char data[80];
+    snprintf(data, sizeof(data), "{\"ts\":%lu,\"code\":\"%s\"}",
+             (unsigned long)(now >= 1700000000 ? now : 0), activeFault);
+    if (appendEvent("ERROR_CLEAR", data)) activeFault = "NONE";
+    else Serial.println("[MTA EVT] CRITICAL: error clear not journaled");
+  }
+}
+
+
+String eventSlotKey(uint16_t slot) {
+  char key[8];
+  snprintf(key, sizeof(key), "ev%02u", slot);
+  return String(key);
+}
+
+bool readEventAt(uint16_t slot, StoredEvent &ev) {
+  String key = eventSlotKey(slot);
+  return eventPrefs.getBytesLength(key.c_str()) == sizeof(ev) &&
+         eventPrefs.getBytes(key.c_str(), &ev, sizeof(ev)) == sizeof(ev) &&
+         ev.magic == MTA_EVENT_MAGIC;
+}
+
+// Crash-safe removal: the durable marker is written first. Recovery finishes it.
+bool finishAcknowledgedHead() {
+  while (eventCount > 0) {
+    String ackKey = String("ack") + String(eventHead);
+    if (!eventPrefs.getBool(ackKey.c_str(), false)) break;
+    uint16_t newHead = (eventHead + 1) % MTA_EVENT_CAPACITY;
+    if (eventPrefs.putUShort("head", newHead) != sizeof(uint16_t)) return false;
+    eventHead = newHead;
+    if (eventPrefs.putUShort("count", eventCount - 1) != sizeof(uint16_t)) return false;
+    --eventCount;
+    eventPrefs.remove(ackKey.c_str());
+  }
+  return true;
+}
+
+bool acknowledgeHead(const char* id) {
+  if (!eventJournalReady || eventCount == 0) return false;
+  StoredEvent ev = {};
+  if (!readEventAt(eventHead, ev) || strcmp(ev.eventId, id) != 0) return false;
+  String key = String("ack") + String(eventHead);
+  if (eventPrefs.putBool(key.c_str(), true) == 0) return false;
+  return finishAcknowledgedHead();
+}
+
+// Restart repair applies the intended stock exactly once if the matching
+// event is already committed to the FIFO. Ambiguous/corrupt states fail closed.
+bool recoverStockOperation() {
+  size_t len = eventPrefs.getBytesLength("stockop");
+  if (len == 0) return true;
+  StockOperation op = {};
+  if (len != sizeof(op) ||
+      eventPrefs.getBytes("stockop", &op, sizeof(op)) != sizeof(op) ||
+      op.magic != MTA_STOCK_OP_MAGIC ||
+      op.sequence == 0 || op.sequence > eventSequence + 1 ||
+      !eventPrefs.isKey("stock")) {
+    Serial.println("[MTA STOCK] RECOVERY BLOCKED: invalid stock-operation intent");
+    return false;
+  }
+  uint16_t saved = eventPrefs.getUShort("stock", UINT16_MAX);
+  if (saved != op.oldStock && saved != op.newStock) {
+    Serial.println("[MTA STOCK] RECOVERY BLOCKED: saved stock disagrees with intent");
+    return false;
+  }
+  bool eventFound = false;
+  for (uint16_t i = 0; i < eventCount; ++i) {
+    StoredEvent ev = {};
+    if (!readEventAt((eventHead + i) % MTA_EVENT_CAPACITY, ev)) {
+      Serial.println("[MTA STOCK] RECOVERY BLOCKED: damaged event journal");
+      return false;
+    }
+    if (ev.sequence == op.sequence) {
+      if (strcmp(ev.eventType, op.eventType) != 0) {
+        Serial.println("[MTA STOCK] RECOVERY BLOCKED: event type mismatch");
+        return false;
+      }
+      eventFound = true;
+      break;
+    }
+  }
+  if (!eventFound) {
+    if (eventSequence < op.sequence && saved == op.oldStock) {
+      // Crash before appendEvent persisted a sequence: no operation committed.
+      if (!eventPrefs.remove("stockop")) return false;
+      Serial.println("[MTA STOCK] RECOVERY: discarded uncommitted stock intent");
+      return true;
+    }
+    Serial.println("[MTA STOCK] RECOVERY BLOCKED: sequenced event absent/ambiguous");
+    return false;
+  }
+  if (saved != op.newStock) {
+    if (eventPrefs.putUShort("stock", op.newStock) != sizeof(uint16_t) ||
+        eventPrefs.getUShort("stock", UINT16_MAX) != op.newStock) {
+      Serial.println("[MTA STOCK] RECOVERY BLOCKED: stock correction failed");
+      return false;
+    }
+  }
+  if (!eventPrefs.remove("stockop")) {
+    Serial.println("[MTA STOCK] RECOVERY BLOCKED: cannot clear recovered intent");
+    return false;
+  }
+  Serial.printf("[MTA STOCK] RECOVERED %s event=%lu stock=%u\n",
+                op.eventType, (unsigned long)op.sequence, (unsigned)op.newStock);
+  return true;
+}
+
+// A single durable intent protects the gap between FIFO append and stock write.
+// On any error, stop new transactions until reboot/reconciliation.
+bool appendStockEvent(const char* type, const char* data, int8_t delta) {
+  if (!eventJournalReady || !stockAccountingHealthy ||
+      eventPrefs.isKey("stockop") || eventCount >= MTA_EVENT_CAPACITY ||
+      (delta != 1 && delta != -1) ||
+      (delta == 1 && localStock == UINT16_MAX) ||
+      (delta == -1 && localStock == 0)) return false;
+  StockOperation op = {};
+  op.magic = MTA_STOCK_OP_MAGIC;
+  op.sequence = eventSequence + 1;
+  op.oldStock = localStock;
+  op.newStock = (uint16_t)((int32_t)localStock + delta);
+  snprintf(op.eventType, sizeof(op.eventType), "%s", type);
+  if (eventPrefs.putBytes("stockop", &op, sizeof(op)) != sizeof(op)) {
+    stockAccountingHealthy = false;
+    Serial.println("[MTA STOCK] CRITICAL: cannot persist operation intent");
+    return false;
+  }
+  if (!appendEvent(type, data)) {
+    stockAccountingHealthy = false;
+    Serial.println("[MTA STOCK] CRITICAL: event append failed; inspect journal on restart");
+    return false;
+  }
+  if (eventSequence != op.sequence ||
+      eventPrefs.putUShort("stock", op.newStock) != sizeof(uint16_t) ||
+      eventPrefs.getUShort("stock", UINT16_MAX) != op.newStock) {
+    stockAccountingHealthy = false;
+    Serial.println("[MTA STOCK] CRITICAL: incomplete stock update; recovery required");
+    return false;
+  }
+  localStock = op.newStock;
+  if (!eventPrefs.remove("stockop")) {
+    stockAccountingHealthy = false;
+    Serial.println("[MTA STOCK] CRITICAL: cannot clear intent; recovery required");
+    return false;
+  }
+  return true;
+}
+
+void setupEventManager() {
+  if (!eventPrefs.begin("mta-events", false)) {
+    Serial.println("[MTA EVT] ERROR: cannot open NVS");
+    return;
+  }
+  eventHead = eventPrefs.getUShort("head", 0);
+  eventCount = eventPrefs.getUShort("count", 0);
+  eventSequence = eventPrefs.getUInt("seq", 0);
+  if (eventHead >= MTA_EVENT_CAPACITY || eventCount > MTA_EVENT_CAPACITY) {
+    Serial.println("[MTA EVT] ERROR: invalid journal metadata; journal disabled");
+    return;
+  }
+  eventJournalReady = true;
+  if (!finishAcknowledgedHead()) {
+    eventJournalReady = false;
+    Serial.println("[MTA EVT] ERROR: journal recovery failed");
+    return;
+  }
+  Serial.printf("[MTA EVT] NVS journal ready: %u/%u stored, next sequence=%lu\n",
+                eventCount, MTA_EVENT_CAPACITY, (unsigned long)(eventSequence + 1));
+  stockAccountingHealthy = recoverStockOperation();
+  if (!stockAccountingHealthy) {
+    eventJournalReady = false;
+    Serial.println("[MTA STOCK] ACCOUNTING LOCKED: inspect NVS; do NOT perform payments");
+  }
+  initializeLocalStock();
+}
+
+bool appendEvent(const char* type, const char* data) {
+  if (!eventJournalReady) {
+    Serial.println("[MTA EVT] ERROR: journal unavailable");
+    return false;
+  }
+  if (eventCount >= MTA_EVENT_CAPACITY) {
+    Serial.println("[MTA EVT] FULL: event NOT recorded (no overwrite)");
+    return false;
+  }
+  // Persist sequence before writing the record: no ID reuse after reboot.
+  const uint32_t nextSeq = eventSequence + 1;
+  if (eventPrefs.putUInt("seq", nextSeq) != sizeof(uint32_t)) {
+    Serial.println("[MTA EVT] ERROR: cannot persist sequence");
+    return false;
+  }
+  eventSequence = nextSeq;
+  StoredEvent ev = {};
+  ev.magic = MTA_EVENT_MAGIC;
+  ev.sequence = nextSeq;
+  snprintf(ev.eventId, sizeof(ev.eventId), "MTA-001-E%010lu", (unsigned long)nextSeq);
+  snprintf(ev.eventType, sizeof(ev.eventType), "%s", type);
+  snprintf(ev.data, sizeof(ev.data), "%s", data);
+  const uint16_t slot = (eventHead + eventCount) % MTA_EVENT_CAPACITY;
+  const String key = eventSlotKey(slot);
+  // Clear stale acknowledgement before writing a new record in this slot.
+  String ackKey = String("ack") + String(slot);
+  if (eventPrefs.getBool(ackKey.c_str(), false)) {
+    Serial.println("[MTA EVT] ERROR: stale acknowledgement, refusing write");
+    return false;
+  }
+  if (eventPrefs.putBytes(key.c_str(), &ev, sizeof(ev)) != sizeof(ev)) {
+    Serial.println("[MTA EVT] ERROR: cannot persist record");
+    return false;
+  }
+  if (eventPrefs.putUShort("count", eventCount + 1) != sizeof(uint16_t)) {
+    Serial.println("[MTA EVT] ERROR: cannot persist count; record needs recovery");
+    eventJournalReady = false;
+    return false;
+  }
+  ++eventCount;
+  Serial.printf("[MTA EVT] SAVED id=%s type=%s queued=%u\n",
+                ev.eventId, ev.eventType, eventCount);
+  return true;
+}
+
+void listEvents() {
+  if (!eventJournalReady) {
+    Serial.println("[MTA EVT] Journal unavailable");
+    return;
+  }
+  Serial.printf("[MTA EVT] STORED EVENTS: %u/%u\n", eventCount, MTA_EVENT_CAPACITY);
+  for (uint16_t i = 0; i < eventCount; ++i) {
+    const uint16_t slot = (eventHead + i) % MTA_EVENT_CAPACITY;
+    StoredEvent ev = {};
+    const String key = eventSlotKey(slot);
+    if (eventPrefs.getBytesLength(key.c_str()) != sizeof(ev) ||
+        eventPrefs.getBytes(key.c_str(), &ev, sizeof(ev)) != sizeof(ev) ||
+        ev.magic != MTA_EVENT_MAGIC) {
+      Serial.printf("[MTA EVT] ERROR: corrupt slot %u\n", slot);
+      continue;
+    }
+    Serial.printf("[MTA EVT] %u: id=%s type=%s data=%s\n",
+                  i + 1, ev.eventId, ev.eventType, ev.data);
+  }
+}
+
+// TEST records are moved to a separate NVS namespace; never sent to server.
+// Archive capacity is 16. The archive is not erased on normal reboot.
+void archiveLegacyTests() {
+  if (!eventJournalReady) return;
+  if (!archivePrefs.begin("mta-test-arc", false)) {
+    Serial.println("[MTA EVT] ERROR: cannot open archive"); return;
+  }
+  while (eventCount > 0) {
+    StoredEvent ev = {};
+    if (!readEventAt(eventHead, ev)) break;
+    if (strcmp(ev.eventType, "TEST") != 0) break;
+    uint16_t archived = archivePrefs.getUShort("count", 0);
+    bool found = false;
+    for (uint16_t i = 0; i < archived; ++i) {
+      char key[9]; snprintf(key, sizeof(key), "t%02u", i);
+      StoredEvent old = {};
+      if (archivePrefs.getBytes(key, &old, sizeof(old)) == sizeof(old) &&
+          strcmp(old.eventId, ev.eventId) == 0) { found = true; break; }
+    }
+    if (!found) {
+      if (archived >= 16) { Serial.println("[MTA EVT] Archive full"); break; }
+      char key[9]; snprintf(key, sizeof(key), "t%02u", archived);
+      if (archivePrefs.putBytes(key, &ev, sizeof(ev)) != sizeof(ev) ||
+          archivePrefs.putUShort("count", archived + 1) != sizeof(uint16_t)) {
+        Serial.println("[MTA EVT] Archive write failed"); break;
+      }
+    }
+    if (!acknowledgeHead(ev.eventId)) {
+      Serial.println("[MTA EVT] Cannot advance archived TEST"); break;
+    }
+    Serial.printf("[MTA EVT] ARCHIVED %s (not sent)\n", ev.eventId);
+  }
+  archivePrefs.end();
+}
+
+// Laboratory service LOAD +1 for MTA-001 / DOBRY_COLA_025 only.
+// This command is never available to a customer and does not claim any
+// individually identified Data Matrix code. The operator must first
+// physically add one can, then register that can with a single D.
+void saveDemoLoad() {
+  if (currentState != SERVICE || !serviceDoorOpen() ||
+      paymentSessionOpen || !paymentCycleFinished || paymentApproved ||
+      paymentFaultLatch || !payment.isIdle() ||
+      payment.uncertainFinancialResult() || paidOutcome != PaidOutcome::NONE ||
+      !eventJournalReady || !stockAccountingHealthy ||
+      eventPrefs.isKey("stockop") || eventDeliveryBlocked ||
+      eventCount >= MTA_EVENT_CAPACITY || eventSendPending) {
+    Serial.println("[MTA LOAD] REFUSED: requires SERVICE + open door, idle payments, healthy NVS/sync, and free queue");
+    return;
+  }
+  if (!nextCanPresent()) {
+    Serial.println("[MTA LOAD] REFUSED: next-can sensor does not detect stock");
+    return;
+  }
+  if (localStock == UINT16_MAX) {
+    Serial.println("[MTA LOAD] REFUSED: local stock overflow");
+    return;
+  }
+  const time_t now = time(nullptr);
+  if (now < 1700000000) {
+    Serial.println("[MTA LOAD] REFUSED: no valid time; connect to Wi-Fi for NTP first");
+    return;
+  }
+  char data[80] = {};
+  snprintf(data, sizeof(data),
+           "{\"product_id\":\"%s\",\"quantity\":1,\"ts\":%lu}",
+           MTA_PRODUCT_ID, (unsigned long)now);
+  if (!appendStockEvent("LOAD", data, +1)) {
+    Serial.println("[MTA LOAD] CRITICAL: LOAD not committed; inspect I/L/N; do not repeat blindly");
+    return;
+  }
+  Serial.printf("[MTA LOAD] SAVED product=%s quantity=1 local_stock=%u; awaits server ACK\n",
+                MTA_PRODUCT_ID, (unsigned)localStock);
+}
+
+// Read-only NVS diagnostics. No changes to journal or partition table.
+void printNvsDiagnostics() {
+  const esp_partition_t* part = esp_partition_find_first(
+      ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_NVS, nullptr);
+  Serial.println("[MTA NVS] --- Diagnostics ---");
+  Serial.printf("[MTA NVS] sizeof(StoredEvent) = %u bytes\n", (unsigned)sizeof(StoredEvent));
+  Serial.printf("[MTA NVS] Journal = %u/%u records\n", eventCount, MTA_EVENT_CAPACITY);
+  if (part) {
+    Serial.printf("[MTA NVS] Partition label=%s, size=%lu bytes (%lu KiB)\n",
+                  part->label, (unsigned long)part->size,
+                  (unsigned long)(part->size / 1024));
+  } else {
+    Serial.println("[MTA NVS] NVS partition not found");
+  }
+  nvs_stats_t stats = {};
+  esp_err_t err = nvs_get_stats(part ? part->label : nullptr, &stats);
+  if (err == ESP_OK) {
+    Serial.printf("[MTA NVS] Entries: used=%lu, free=%lu, total=%lu, namespaces=%lu\n",
+                  (unsigned long)stats.used_entries, (unsigned long)stats.free_entries,
+                  (unsigned long)stats.total_entries, (unsigned long)stats.namespace_count);
+    Serial.println("[MTA NVS] Note: entries are NVS slots, not bytes; blobs use multiple slots.");
+  } else {
+    Serial.printf("[MTA NVS] nvs_get_stats error=0x%X\n", (unsigned)err);
+  }
+}
+
+// One-time recovery after intentional full Flash erase and NVS repartition.
+// Last accepted event was E0000000012; next new event must be E0000000013.
+// This command is deliberately NOT a general-purpose counter setter.
+void restoreEventSequence13() {
+  const uint32_t LAST_SEQUENCE_BEFORE_MIGRATION = 12;
+  if (!eventJournalReady || eventCount != 0 || eventHead != 0 || eventSequence != 0) {
+    Serial.printf("[MTA EVT] RESTORE REFUSED: ready=%u, count=%u, head=%u, seq=%lu\n",
+                  (unsigned)eventJournalReady, (unsigned)eventCount,
+                  (unsigned)eventHead, (unsigned long)eventSequence);
+    return;
+  }
+  // A fresh NVS must not contain any pre-existing journal slot or ACK flag.
+  for (uint16_t slot = 0; slot < MTA_EVENT_CAPACITY; ++slot) {
+    String key = eventSlotKey(slot);
+    String ackKey = String("ack") + String(slot);
+    if (eventPrefs.isKey(key.c_str()) || eventPrefs.isKey(ackKey.c_str())) {
+      Serial.println("[MTA EVT] RESTORE REFUSED: stale journal keys found");
+      return;
+    }
+  }
+  if (eventPrefs.putUInt("seq", LAST_SEQUENCE_BEFORE_MIGRATION) != sizeof(uint32_t)) {
+    Serial.println("[MTA EVT] RESTORE FAILED: NVS write failed");
+    return;
+  }
+  const uint32_t confirmed = eventPrefs.getUInt("seq", 0);
+  if (confirmed != LAST_SEQUENCE_BEFORE_MIGRATION) {
+    Serial.println("[MTA EVT] RESTORE FAILED: readback mismatch");
+    eventJournalReady = false;
+    return;
+  }
+  eventSequence = confirmed;
+  Serial.println("[MTA EVT] RESTORED: last sequence=12, next sequence=13");
+}
+
+
+// ============================================================
+// DIAGNOSTICS v0.3.8b-DIAG: read-only GPIO and readiness snapshot
+// Send P in Serial Monitor (115200 baud). No GPIO writes here.
+// ============================================================
+void printReadinessDiagnostics() {
+  const char* stateNames[] = {"IDLE", "WAIT_PAYMENT", "DISPENSING", "SUCCESS", "EMPTY", "SERVICE", "SERVICE_DISPENSING", "WAIT_CLEAR_DISPENSER", "WAIT_SHUTTER_CLOSE", "ERROR_STATE"};
+  int st = (int)currentState;
+  Serial.println("\n[MTA DIAG] ===== INPUT SNAPSHOT =====");
+  Serial.printf("[MTA DIAG] state=%s (%d)\n", st >= 0 && st < 10 ? stateNames[st] : "UNKNOWN", st);
+  Serial.printf("[MTA DIAG] GPIO16 door=%d (OPEN when HIGH) => %s\n", digitalRead(PIN_SERVICE_DOOR), serviceDoorOpen() ? "OPEN" : "CLOSED");
+  Serial.printf("[MTA DIAG] GPIO19 shutter=%d (RAISED when LOW) => %s\n", digitalRead(PIN_SHUTTER), shutterRaised() ? "RAISED" : "DOWN");
+  Serial.printf("[MTA DIAG] GPIO21 exit=%d (NORMAL when LOW) => %s\n", digitalRead(PIN_CAN_EXIT), canExitAbnormal() ? "ABNORMAL" : "NORMAL");
+  Serial.printf("[MTA DIAG] GPIO35 next_can=%d (PRESENT when LOW) => %s\n", digitalRead(PIN_NEXT_CAN), nextCanPresent() ? "PRESENT" : "ABSENT");
+  Serial.printf("[MTA DIAG] GPIO34 tray=%d (OCCUPIED when LOW) => %s\n", digitalRead(PIN_TRAY_SENSOR), trayOccupied() ? "OCCUPIED" : "CLEAR");
+  const char* reason = serviceDoorOpen() ? "SERVICE: door open" : shutterRaised() ? "WAIT_SHUTTER_CLOSE: shutter raised" : canExitAbnormal() ? "ERROR_STATE: exit switch abnormal" : !nextCanPresent() ? "EMPTY: next can absent" : trayOccupied() ? "WAIT_CLEAR_DISPENSER: tray occupied" : "IDLE: all readiness inputs OK";
+  Serial.printf("[MTA DIAG] Readiness result IF checked now: %s\n", reason);
+  Serial.println("[MTA DIAG] ==========================\n");
+}
+
+// One-time experimental accounting reset; requires two distinct serial commands.
+// Intentionally preserves NVS event sequence (global event IDs must never repeat).
+// PaymentManager preferences and Wi-Fi secrets are NOT touched.
+static bool accountingResetArmed = false;
+static uint32_t accountingResetArmedAt = 0;
+const uint32_t ACCOUNTING_RESET_WINDOW_MS = 10000;
+
+bool accountingResetAllowed() {
+  return !MTA_ENABLE_EVENT_UPLOAD && eventJournalReady && stockAccountingHealthy &&
+         !eventPrefs.isKey("stockop") && !eventSendPending &&
+         currentState == IDLE && !paymentSessionOpen &&
+         !paymentFaultLatch && !payment.uncertainFinancialResult() &&
+         payment.isIdle();
+}
+
+void resetExperimentalAccounting() {
+  accountingResetArmed = false;
+  if (!accountingResetAllowed()) {
+    Serial.println("[MTA RESET] REFUSED: machine not idle, payment pending, or event upload enabled");
+    return;
+  }
+  // Each acknowledgement persists its own position. A power loss may leave
+  // a PARTIAL reset; re-run Z then Y after checking the machine is safe.
+  while (eventCount > 0) {
+    StoredEvent ev = {};
+    if (!readEventAt(eventHead, ev) || !acknowledgeHead(ev.eventId)) {
+      Serial.println("[MTA RESET] STOPPED: journal could not be advanced");
+      return;
+    }
+  }
+  if (eventPrefs.putUShort("stock", 0) != sizeof(uint16_t)) {
+    Serial.println("[MTA RESET] ERROR: could not persist stock=0");
+    return;
+  }
+  localStock = eventPrefs.getUShort("stock", 65535);
+  if (localStock != 0) {
+    Serial.println("[MTA RESET] ERROR: stock readback failed");
+    return;
+  }
+  Serial.printf("[MTA RESET] COMPLETE: stock=0, pending=0, preserved seq=%lu (next=%lu)\n",
+                (unsigned long)eventSequence, (unsigned long)(eventSequence + 1));
+  // Let the normal readiness state machine handle EMPTY on a later check.
+}
+
+void processEventTestCommands() {
+  while (Serial.available() > 0) {
+    const char command = (char)Serial.read();
+    if (accountingResetArmed &&
+        (uint32_t)(millis() - accountingResetArmedAt) > ACCOUNTING_RESET_WINDOW_MS) {
+      accountingResetArmed = false;
+      Serial.println("[MTA RESET] Confirmation expired");
+    }
+    if (command == 'Z') {
+      if (!accountingResetAllowed()) {
+        accountingResetArmed = false;
+        Serial.println("[MTA RESET] REFUSED: not safe to arm");
+      } else {
+        accountingResetArmed = true;
+        accountingResetArmedAt = millis();
+        Serial.println("[MTA RESET] ARMED for 10 s. Send capital Y to clear TEST stock and pending events; sequence preserved");
+      }
+    } else if (command == 'Y') {
+      if (accountingResetArmed) resetExperimentalAccounting();
+      else Serial.println("[MTA RESET] NOT ARMED; send capital Z first");
+    } else if (command == 'P' || command == 'p') printReadinessDiagnostics();
+    else if (command == 'T' || command == 't') appendEvent("TEST", "serial-test");
+    else if (command == 'L' || command == 'l') listEvents();
+    else if (command == 'I' || command == 'i') Serial.printf("[MTA STOCK] Local stock=%u\n", localStock);
+    else if (command == 'A' || command == 'a') archiveLegacyTests();
+    else if (command == 'D' || command == 'd') saveDemoLoad();
+    else if (command == 'N' || command == 'n') printNvsDiagnostics();
+    else if (command == 'R' || command == 'r') restoreEventSequence13();
+    else if (command == 'Q' || command == 'q') printPaymentDiagnostics();
+    else if (command == 'X') clearPaymentInterlock();
+  }
+}
+
+// Only the main loop reads/writes Preferences; network task uses FreeRTOS queues.
+void processEventDelivery() {
+  if (!eventJournalReady || !eventSendQueue || !eventResultQueue) return;
+  EventSendResult result = {};
+  if (xQueueReceive(eventResultQueue, &result, 0) == pdTRUE) {
+    eventSendPending = false;
+    if (result.accepted) {
+      if (acknowledgeHead(result.eventId)) {
+        Serial.printf("[MTA EVT] CONFIRMED %s, remaining=%u\n", result.eventId, eventCount);
+      } else {
+        eventDeliveryBlocked = true;
+        Serial.println("[MTA EVT] CRITICAL: confirmation not persisted; delivery BLOCKED");
+      }
+    } else {
+      Serial.printf("[MTA EVT] NOT confirmed id=%s HTTP=%d; retained for retry\n",
+                    result.eventId, result.httpCode);
+      // 4xx means invalid request/auth/schema. Stop retries until diagnosis;
+      // the journal remains intact. Network failures and 5xx can retry.
+      if (result.httpCode >= 400 && result.httpCode < 500) {
+        eventDeliveryBlocked = true;
+        Serial.println("[MTA EVT] DELIVERY BLOCKED after HTTP 4xx; operator review required");
+      }
+    }
+  }
+  if (!MTA_ENABLE_EVENT_UPLOAD || eventDeliveryBlocked ||
+      !eventJournalReady || !stockAccountingHealthy || eventPrefs.isKey("stockop") ||
+      eventSendPending || eventCount == 0 ||
+      (eventLastAttempt && millis() - eventLastAttempt < EVENT_RETRY_MS)) return;
+  StoredEvent ev = {};
+  if (!readEventAt(eventHead, ev)) {
+    Serial.println("[MTA EVT] ERROR: corrupt head; delivery stopped"); return;
+  }
+  // FIFO order is preserved. Never bypass unknown or TEST head events.
+  if (strcmp(ev.eventType, "TEST") == 0) return; // Archive explicitly with A.
+  const bool isLoad = strcmp(ev.eventType, "LOAD") == 0;
+  const bool isSale = strcmp(ev.eventType, "SALE") == 0;
+  const bool isErrorSet = strcmp(ev.eventType, "ERROR_SET") == 0;
+  const bool isErrorClear = strcmp(ev.eventType, "ERROR_CLEAR") == 0;
+  if (!isLoad && !isSale && !isErrorSet && !isErrorClear) {
+    Serial.println("[MTA EVT] Unsupported event at head; retained"); return;
+  }
+  const char* tsField = strstr(ev.data, "\"ts\":");
+  if (!tsField) { Serial.println("[MTA EVT] Missing timestamp; retained"); return; }
+  unsigned long unixSeconds = strtoul(tsField + 5, nullptr, 10);
+  if (unixSeconds < 1700000000) {
+    time_t now = time(nullptr);
+    if (now < 1700000000) {
+      // Do not send a fabricated 1970 timestamp. Retain in the NVS journal.
+      static uint32_t lastClockNoticeMs = 0;
+      const uint32_t nowMs = millis();
+      if (lastClockNoticeMs == 0 || (uint32_t)(nowMs - lastClockNoticeMs) >= 30000) {
+        lastClockNoticeMs = nowMs;
+        Serial.println("[MTA EVT] Waiting for valid NTP time; event retained");
+      }
+      return;
+    }
+    unixSeconds = (unsigned long)now; // estimated time when offline clock was unset
+  }
+  struct tm utc = {};
+  time_t stamp = (time_t)unixSeconds;
+  gmtime_r(&stamp, &utc);
+  char iso[32]; strftime(iso, sizeof(iso), "%Y-%m-%dT%H:%M:%SZ", &utc);
+  EventSendRequest req = {};
+  snprintf(req.eventId, sizeof(req.eventId), "%s", ev.eventId);
+  if (isLoad) {
+    snprintf(req.payload, sizeof(req.payload),
+             "{\"event_id\":\"%s\",\"device_id\":\"MTA-001\","
+             "\"event_type\":\"LOAD\",\"created_at\":\"%s\","
+             "\"data\":{\"product_id\":\"%s\",\"quantity\":1}}",
+             ev.eventId, iso, MTA_PRODUCT_ID);
+  } else if (isSale) {
+    snprintf(req.payload, sizeof(req.payload),
+             "{\"event_id\":\"%s\",\"device_id\":\"MTA-001\","
+             "\"event_type\":\"SALE\",\"session_id\":\"%s\","
+             "\"created_at\":\"%s\",\"data\":{\"product_id\":\"%s\","
+             "\"price\":%d,\"payment\":\"SUCCESS\",\"dispense\":\"SUCCESS\"}}",
+             ev.eventId, ev.eventId, iso, MTA_PRODUCT_ID, (int)MTA_PRICE_KOPECKS);
+  } else {
+    const char* code = strstr(ev.data, "\"code\":\"");
+    if (!code) { Serial.println("[MTA EVT] Missing error code; retained"); return; }
+    code += 8;
+    char fault[32] = {};
+    size_t n = 0;
+    while (code[n] && code[n] != '"' && n < sizeof(fault) - 1) { fault[n] = code[n]; ++n; }
+    snprintf(req.payload, sizeof(req.payload),
+             "{\"event_id\":\"%s\",\"device_id\":\"MTA-001\","
+             "\"event_type\":\"%s\",\"created_at\":\"%s\","
+             "\"data\":{\"error_code\":\"%s\"}}",
+             ev.eventId, isErrorSet ? "ERROR_SET" : "ERROR_CLEAR", iso, fault);
+  }
+  if (xQueueSend(eventSendQueue, &req, 0) == pdTRUE) {
+    eventSendPending = true;
+    eventLastAttempt = millis();
+    Serial.printf("[MTA SYNC] AUTO QUEUED id=%s; awaiting HTTP response\n", ev.eventId);
+  }
+}
+
+// ============================================================
+// COMMUNICATION MANAGER (v0.3.6)
+// Wi-Fi and HTTP run on a separate FreeRTOS task.
+// Never perform network operations in the mechanical loop.
+// ============================================================
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include "mta_tls_ca.h"
+#include "mta_secrets.h"  // Local only; never commit real credentials.
+
+// Wi-Fi credentials and MTA_DEVICE_KEY come from mta_secrets.h.
+const char* MTA_HEARTBEAT_URL =
+  "https://api.wantpaytake.ru/api/v1/device/heartbeat";
+const char* MTA_DEVICE_ID = "MTA-001";
+const char* MTA_EVENTS_URL = "https://api.wantpaytake.ru/api/v1/device/events";
+
+const unsigned long MTA_HEARTBEAT_INTERVAL_MS = 10000;
+const unsigned long MTA_WIFI_RETRY_MS = 10000;
+
+struct HeartbeatSnapshot {
+  char state[32];
+  char activeError[32];
+};
+
+QueueHandle_t heartbeatQueue = nullptr;
+unsigned long lastHeartbeatSnapshotAt = 0;
+
+const char* stateNameForServer(MachineState state) {
+  switch (state) {
+    case IDLE: return "IDLE";
+    case WAIT_PAYMENT: return "WAIT_PAYMENT";
+    case DISPENSING: return "DISPENSING";
+    case SUCCESS: return "SUCCESS";
+    case EMPTY: return "EMPTY";
+    case SERVICE: return "SERVICE";
+    case SERVICE_DISPENSING: return "SERVICE_DISPENSING";
+    case WAIT_CLEAR_DISPENSER: return "WAIT_CLEAR_DISPENSER";
+    case WAIT_SHUTTER_CLOSE: return "WAIT_SHUTTER_CLOSE";
+    case ERROR_STATE: return "ERROR";
+    default: return "ERROR";
+  }
+}
+
+void queueHeartbeatSnapshot() {
+  if (heartbeatQueue == nullptr) return;
+  HeartbeatSnapshot snapshot = {};
+  snprintf(snapshot.state, sizeof(snapshot.state), "%s", stateNameForServer(currentState));
+  // v0.3.5 has no specific fault-code tracking yet.
+  // Generic marker until ErrorManager/EventManager integration.
+  snprintf(snapshot.activeError, sizeof(snapshot.activeError), "%s",
+           currentState == ERROR_STATE ? "UNCLASSIFIED_ERROR" : "NONE");
+  xQueueOverwrite(heartbeatQueue, &snapshot);
+}
+
+void communicationTask(void* parameter) {
+  HeartbeatSnapshot snapshot;
+  unsigned long lastWiFiAttempt = 0;
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  configTime(0, 0, "pool.ntp.org", "time.google.com");
+  Serial.println("[MTA NET] Task started: Heartbeat + Events + NTP time sync");
+
+  for (;;) {
+    if (WiFi.status() != WL_CONNECTED) {
+      const unsigned long now = millis();
+      if (lastWiFiAttempt == 0 || now - lastWiFiAttempt >= MTA_WIFI_RETRY_MS) {
+        lastWiFiAttempt = now;
+        WiFi.begin(MTA_WIFI_SSID, MTA_WIFI_PASSWORD);
+        Serial.println("[MTA NET] Connecting to Wi-Fi...");
+      }
+      // Drop stale snapshots while offline; heartbeat is current state, not a journal.
+      if (heartbeatQueue != nullptr) xQueueReceive(heartbeatQueue, &snapshot, 0);
+      vTaskDelay(pdMS_TO_TICKS(250));
+      continue;
+    }
+
+    // TLS certificate verification needs valid system time from NTP.
+    // Do not dequeue events or send a heartbeat until the clock is ready.
+    if (time(nullptr) < 1700000000) {
+      vTaskDelay(pdMS_TO_TICKS(500));
+      continue;
+    }
+
+    // One FIFO event request at a time. On failure the main loop retains it.
+    EventSendRequest request = {};
+    if (eventSendQueue && xQueueReceive(eventSendQueue, &request, 0) == pdTRUE) {
+      EventSendResult result = {};
+      snprintf(result.eventId, sizeof(result.eventId), "%s", request.eventId);
+      WiFiClientSecure eventTls;
+      eventTls.setCACert(MTA_TLS_ROOT_CA);
+      HTTPClient eventHttp;
+      eventHttp.setConnectTimeout(6000);
+      eventHttp.setTimeout(6000);
+      if (eventHttp.begin(eventTls, MTA_EVENTS_URL)) {
+        eventHttp.addHeader("Content-Type", "application/json");
+        eventHttp.addHeader("X-MTA-Key", MTA_DEVICE_KEY);
+        result.httpCode = eventHttp.POST(String(request.payload));
+        if (result.httpCode == 200) {
+          String response = eventHttp.getString();
+          // Match the exact status and event ID; a generic substring is unsafe.
+          String idNeedle = String("\"event_id\":\"") + request.eventId + "\"";
+          bool matchId = response.indexOf(idNeedle) >= 0;
+          bool accepted = response.indexOf("\"status\":\"accepted\"") >= 0 ||
+                          response.indexOf("\"status\":\"already_accepted\"") >= 0;
+          result.accepted = matchId && accepted;
+        }
+        eventHttp.end();
+      } else result.httpCode = -1;
+      Serial.printf("[MTA NET] Event id=%s HTTP=%d confirmed=%d\n",
+                    result.eventId, result.httpCode, result.accepted);
+      if (eventResultQueue) xQueueSend(eventResultQueue, &result, portMAX_DELAY);
+    }
+    if (xQueueReceive(heartbeatQueue, &snapshot, pdMS_TO_TICKS(250)) == pdTRUE) {
+      Serial.printf("[MTA NET] Wi-Fi connected, IP=%s\n", WiFi.localIP().toString().c_str());
+      WiFiClientSecure heartbeatTls;
+      heartbeatTls.setCACert(MTA_TLS_ROOT_CA);
+      HTTPClient http;
+      http.setConnectTimeout(6000);
+      http.setTimeout(6000);
+      if (http.begin(heartbeatTls, MTA_HEARTBEAT_URL)) {
+        http.addHeader("Content-Type", "application/json");
+        http.addHeader("X-MTA-Key", MTA_DEVICE_KEY);
+        String payload = String("{\"device_id\":\"") + MTA_DEVICE_ID +
+          "\",\"state\":\"" + snapshot.state +
+          "\",\"active_error\":\"" + snapshot.activeError + "\"}";
+        int code = http.POST(payload);
+        Serial.printf("[MTA NET] Heartbeat state=%s HTTP=%d\n", snapshot.state, code);
+        http.end();
+      } else {
+        Serial.println("[MTA NET] HTTP begin failed");
+      }
+    }
+  }
+}
+
+void setupCommunication() {
+  eventSendQueue = xQueueCreate(1, sizeof(EventSendRequest));
+  eventResultQueue = xQueueCreate(1, sizeof(EventSendResult));
+  heartbeatQueue = xQueueCreate(1, sizeof(HeartbeatSnapshot));
+  if (heartbeatQueue == nullptr || eventSendQueue == nullptr || eventResultQueue == nullptr) {
+    Serial.println("[MTA NET] Cannot allocate communication queues");
+    if (heartbeatQueue) { vQueueDelete(heartbeatQueue); heartbeatQueue = nullptr; }
+    if (eventSendQueue) { vQueueDelete(eventSendQueue); eventSendQueue = nullptr; }
+    if (eventResultQueue) { vQueueDelete(eventResultQueue); eventResultQueue = nullptr; }
+    return;
+  }
+  BaseType_t started = xTaskCreatePinnedToCore(
+    communicationTask, "MTA_Network", 8192, nullptr, 1, nullptr, 0
+  );
+  if (started != pdPASS) {
+    Serial.println("[MTA NET] Cannot start network task");
+    vQueueDelete(heartbeatQueue); heartbeatQueue = nullptr;
+    vQueueDelete(eventSendQueue); eventSendQueue = nullptr;
+    vQueueDelete(eventResultQueue); eventResultQueue = nullptr;
+  }
+}
+
+void processCommunication() {
+  const unsigned long now = millis();
+  if (lastHeartbeatSnapshotAt == 0 ||
+      now - lastHeartbeatSnapshotAt >= MTA_HEARTBEAT_INTERVAL_MS) {
+    lastHeartbeatSnapshotAt = now;
+    queueHeartbeatSnapshot();
+  }
+}
+
+
+// ============================================================
+// PAYMENT INTEGRATION v0.4.6 — WI-FI + HEARTBEAT + EVENTS
+// NOTE: bank approval is distinct from physical dispense and report ACK.
+// ============================================================
+
+const char* paidOutcomeName(PaidOutcome result) {
+  switch (result) {
+    case PaidOutcome::NONE: return "NONE";
+    case PaidOutcome::DISPENSED: return "DISPENSED";
+    case PaidOutcome::NOT_DISPENSED: return "NOT_DISPENSED";
+    case PaidOutcome::UNKNOWN: return "UNKNOWN";
+  }
+  return "?";
+}
+
+// NVS "phase": 0=clear, 1=session started, 2=approved,
+// 3=dispensed/report pending, 4=refund pending, 5=unknown,
+// 6=refund ACK (manual inspection still required).
+// Any nonzero value at boot is treated as unresolved until safely cleared.
+bool persistPaymentPhase(uint8_t phase) {
+  if (!paymentNvsReady) return false;
+  if (paymentPrefs.putUChar("phase", phase) != sizeof(uint8_t)) return false;
+  return paymentPrefs.getUChar("phase", 255) == phase;
+}
+
+void lockPayment(const char* reason, uint8_t phase) {
+  paymentFaultLatch = true;
+  if (paymentNvsReady && phase) {
+    if (!persistPaymentPhase(phase)) Serial.println("[MTA PAY] CRITICAL: NVS persistence failure");
+  }
+  Serial.printf("[MTA PAY] BLOCKED: %s\n", reason);
+  if (currentState != ERROR_STATE) changeState(ERROR_STATE);
+}
+
+void onPaymentTimer(PaymentManager::Timer timer, uint32_t duration, void*) {
+  paymentTimer = timer;
+  paymentTimerStartedAt = millis();
+  paymentTimerDuration = duration;
+}
+
+void onPaymentEvent(PaymentManager::Event event, PaymentManager::Error error, void*) {
+  Serial.printf("[MTA PAY] %s (error=%s)\n",
+                PaymentManager::eventName(event), PaymentManager::errorName(error));
+  switch (event) {
+    case PaymentManager::Event::PAYMENT_STARTED:
+      break;
+
+    case PaymentManager::Event::PAYMENT_APPROVED:
+      paymentApproved = true;
+      if (!persistPaymentPhase(2)) {
+        // Financial status accepted, but persistence unavailable: no dispense.
+        lockPayment("cannot persist approved payment", 0);
+        return;
+      }
+      if (currentState != WAIT_PAYMENT || serviceDoorOpen() || shutterRaised() ||
+          canExitAbnormal() || !nextCanPresent() || trayOccupied() || paymentFaultLatch) {
+        // Motor was NOT started, therefore non-delivery is confirmed.
+        beginConfirmedNonDelivery();
+        changeState(ERROR_STATE);
+      } else {
+        changeState(DISPENSING);
+      }
+      break;
+
+    case PaymentManager::Event::PAYMENT_NO_CARD:
+    case PaymentManager::Event::PAYMENT_DECLINED:
+      // Do not change machine to IDLE before PAYMENT_CYCLE_FINISHED.
+      break;
+
+    case PaymentManager::Event::SALE_REPORTED:
+      // ACK means protocol acceptance, NOT bank clearing.
+      paymentSaleAccepted = true;
+      break;
+
+    case PaymentManager::Event::REFUND_REQUEST_ACCEPTED:
+      // ACK means refund command accepted, NOT confirmed bank refund.
+      if (!persistPaymentPhase(6)) lockPayment("cannot persist refund ACK", 0);
+      break;
+
+    case PaymentManager::Event::PAYMENT_CYCLE_FINISHED:
+      paymentCycleFinished = true;
+      if (paidOutcome == PaidOutcome::NONE && !paymentApproved) {
+        if (!persistPaymentPhase(0)) { lockPayment("cannot clear finished session", 0); break; }
+        paymentSessionOpen = false;
+        if (currentState == WAIT_PAYMENT && !paymentFaultLatch) runReadinessCheck(IDLE);
+      } else if (paidOutcome == PaidOutcome::DISPENSED && paymentSaleAccepted) {
+        if (!persistPaymentPhase(0)) { lockPayment("cannot clear completed sale", 0); break; }
+        paymentSessionOpen = false;
+        if (currentState == SUCCESS && !trayOccupied() && !paymentFaultLatch)
+          runReadinessCheck(IDLE);
+      } else {
+        // No automatic recovery from a refund, unknown dispense or mismatch.
+        lockPayment("requires service review of payment outcome", 0);
+      }
+      break;
+
+    case PaymentManager::Event::PAYMENT_ERROR:
+      // Includes display ACK loss, card/auth timeout, and financial uncertainty.
+      lockPayment("Vendista communication or transaction error", 0);
+      break;
+  }
+}
+
+void setupPaymentIntegration() {
+  paymentNvsReady = paymentPrefs.begin("mta-pay-v040", false);
+  if (!paymentNvsReady) {
+    paymentFaultLatch = true;
+    Serial.println("[MTA PAY] CRITICAL: cannot open payment NVS");
+  } else {
+    const uint8_t pending = paymentPrefs.getUChar("phase", 0);
+    paymentFaultLatch = pending != 0;
+    if (paymentFaultLatch)
+      Serial.printf("[MTA PAY] BOOT INTERLOCK: unresolved persisted phase=%u\n", pending);
+  }
+  PaymentManager::Config cfg;
+  cfg.rxPin = 39;
+  cfg.txPin = 15;
+  cfg.baud = 115200;
+  cfg.gsm = true;
+  payment.begin(cfg, onPaymentEvent, onPaymentTimer);
+  Serial.printf("[MTA PAY] UART2 GPIO39 RX / GPIO15 TX; price=%lu kop, item=%u\n",
+                (unsigned long)MTA_PRICE_KOPECKS, MTA_HUMAN_ITEM);
+}
+
+void startPaidSession() {
+  if (!stockAccountingHealthy || !eventJournalReady ||
+      eventDeliveryBlocked || eventCount >= MTA_EVENT_CAPACITY ||
+      eventPrefs.isKey("stockop") ||
+      currentState != IDLE || paymentFaultLatch || paymentSessionOpen ||
+      !payment.isIdle() || payment.uncertainFinancialResult() ||
+      serviceDoorOpen() || shutterRaised() || canExitAbnormal() ||
+      !nextCanPresent() || trayOccupied()) {
+    Serial.println("[MTA PAY] START blocked: machine not ready");
+    if (currentState == IDLE && !paymentFaultLatch && !paymentSessionOpen)
+      runReadinessCheck(IDLE);
+    return;
+  }
+  if (localStock == 0) {
+    Serial.println("[MTA PAY] START blocked: local stock zero");
+    changeState(EMPTY);
+    return;
+  }
+  if (!persistPaymentPhase(1)) {
+    lockPayment("cannot reserve persistent payment session", 0);
+    return;
+  }
+  paymentSessionOpen = true;
+  paymentCycleFinished = false;
+  paymentApproved = false;
+  paymentSaleAccepted = false;
+  paidOutcome = PaidOutcome::NONE;
+  changeState(WAIT_PAYMENT);
+  if (!payment.startPayment(MTA_PRICE_KOPECKS, MTA_HUMAN_ITEM)) {
+    lockPayment("PaymentManager refused start", 0);
+  }
+}
+
+void beginConfirmedNonDelivery() {
+  if (!paymentApproved || paidOutcome != PaidOutcome::NONE) return;
+  paidOutcome = PaidOutcome::NOT_DISPENSED;
+  requestRefund(); // existing indicator only; terminal refund via PaymentManager
+  if (!persistPaymentPhase(4))
+    lockPayment("cannot persist non-delivery", 0);
+  // Never withhold a confirmed non-delivery refund merely due to NVS failure.
+  if (!payment.reportNotDispensed()) lockPayment("refund command could not be sent", 0);
+}
+
+void markUncertainOutcome(const char* reason) {
+  if (!paymentApproved || paidOutcome != PaidOutcome::NONE) return;
+  paidOutcome = PaidOutcome::UNKNOWN;
+  lockPayment(reason, 5); // No VendReport and no CancelLastTransaction.
+}
+
+void paymentStateChanged(MachineState previousState, MachineState nextState) {
+  if (!paymentSessionOpen || !paymentApproved) return;
+  if (previousState == DISPENSING && nextState == SUCCESS) {
+    if (paidOutcome != PaidOutcome::NONE) return;
+    paidOutcome = PaidOutcome::DISPENSED;
+    if (!persistPaymentPhase(3))
+      lockPayment("sale confirmed but cannot persist outcome", 0);
+    // Physical delivery was confirmed, so still transmit VendReport.
+    if (!payment.confirmDispensed()) lockPayment("VendReport not issued", 0);
+  } else if (nextState == ERROR_STATE && paidOutcome == PaidOutcome::NONE) {
+    // Generic abnormal interruption after motor began: may have dispensed.
+    if (previousState == DISPENSING) markUncertainOutcome("dispense interrupted; physical outcome unknown");
+    else beginConfirmedNonDelivery(); // motor never started
+  }
+}
+
+void processPayment() {
+  const uint32_t now = millis();
+  if (paymentLastPollAt != 0) {
+    const uint32_t gap = now - paymentLastPollAt;
+    if (gap > paymentMaxPollGapMs) paymentMaxPollGapMs = gap;
+  }
+  paymentLastPollAt = now;
+  const uint32_t startUs = micros();
+  payment.update();
+  const uint32_t costUs = micros() - startUs;
+  if (costUs > paymentMaxUpdateCostUs) paymentMaxUpdateCostUs = costUs;
+  if (paymentTimer != PaymentManager::Timer::NONE &&
+      (uint32_t)(millis() - paymentTimerStartedAt) >= paymentTimerDuration) {
+    auto expired = paymentTimer;
+    paymentTimer = PaymentManager::Timer::NONE;
+    payment.onTimeout(expired);
+  }
+}
+
+void printPaymentDiagnostics() {
+  Serial.printf("[MTA PAY] state=%s PM=%s open=%u approved=%u outcome=%s "
+                "finished=%u saleACK=%u fault=%u PMuncertain=%u NVSphase=%u\n",
+                stateNameForServer(currentState), PaymentManager::stateName(payment.state()),
+                paymentSessionOpen, paymentApproved, paidOutcomeName(paidOutcome),
+                paymentCycleFinished, paymentSaleAccepted, paymentFaultLatch,
+                payment.uncertainFinancialResult(),
+                paymentNvsReady ? paymentPrefs.getUChar("phase", 255) : 255);
+  Serial.printf("[MTA PAY] UART good=%lu CRC=%lu discarded=%lu raw=%lu\n",
+                (unsigned long)payment.goodFrames(), (unsigned long)payment.badCrcFrames(),
+                (unsigned long)payment.discardedBytes(), (unsigned long)payment.rawRxBytes());
+  Serial.printf("[MTA TEST] Payment poll maxGapMs=%lu maxUpdateUs=%lu\n",
+                (unsigned long)paymentMaxPollGapMs, (unsigned long)paymentMaxUpdateCostUs);
+  Serial.printf("[MTA UART] HW monitor=%s break=%lu bufferFull=%lu fifoOverflow=%lu frame=%lu parity=%lu peakPending=%lu\n",
+                payment.hasHardwareErrorMonitor() ? "YES" : "NO",
+                (unsigned long)payment.hwBreak(), (unsigned long)payment.hwBufferFull(),
+                (unsigned long)payment.hwFifoOverflow(), (unsigned long)payment.hwFrame(),
+                (unsigned long)payment.hwParity(), (unsigned long)payment.peakRxPending());
+  Serial.printf("[MTA UART] Parser invalidLength=%lu partialTimeout=%lu\n",
+                (unsigned long)payment.invalidLengthBytes(),
+                (unsigned long)payment.partialFrameTimeouts());
+}
+
+void clearPaymentInterlock() {
+  // Deliberately NOT an automatic reset. Verify Vendista transaction externally.
+  if (!serviceDoorOpen() || motorRunning || !paymentNvsReady ||
+      !paymentFaultLatch) {
+    Serial.println("[MTA PAY] X refused: service door must be open, motor stopped, fault latched");
+    return;
+  }
+  if (!persistPaymentPhase(0)) {
+    Serial.println("[MTA PAY] X failed: NVS write error");
+    return;
+  }
+  Serial.println("[MTA PAY] MANUAL INTERLOCK CLEARED; rebooting. Verify banking outcome first!");
+  Serial.flush();
+  ESP.restart();
+}
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("[MTA] WANT!PAY!TAKE! Firmware v0.4.13 Test LOAD + FIFO Delivery starting");
+  setupEventManager();
+  Serial.println("[MTA EVT] v0.4.13: FIFO LOAD/SALE/ERROR upload; D=service LOAD+1; L=list I=stock Q=payment");
+
+  // ----------------------------------------------------------
+  // OUTPUTS
+  // ----------------------------------------------------------
+
+  pinMode(PIN_WANT_WINDOW, OUTPUT);
+  pinMode(PIN_ARROW, OUTPUT);
+  pinMode(PIN_WANT_BUTTON_LED, OUTPUT);
+
+  pinMode(PIN_LED_READY, OUTPUT);
+  pinMode(PIN_LED_DISPENSE, OUTPUT);
+  pinMode(PIN_LED_TAKE, OUTPUT);
+  pinMode(PIN_LED_EMPTY, OUTPUT);
+  pinMode(PIN_LED_ERROR, OUTPUT);
+
+  pinMode(PIN_MOTOR_RELAY, OUTPUT);
+  pinMode(PIN_REFUND_LED, OUTPUT);
+  pinMode(PIN_BUZZER, OUTPUT);
+
+
+  // ----------------------------------------------------------
+  // SAFE OUTPUT STATE
+  // ----------------------------------------------------------
+
+  allCustomerIndicatorsOff();
+
+  digitalWrite(PIN_MOTOR_RELAY, LOW);
+  digitalWrite(PIN_REFUND_LED, LOW);
+  digitalWrite(PIN_BUZZER, LOW);
+
+  motorRunning = false;
+  refundRequested = false;
+
+
+  // ----------------------------------------------------------
+  // INPUTS WITH INTERNAL PULL-UP
+  // ----------------------------------------------------------
+
+  pinMode(PIN_WANT_BUTTON, INPUT_PULLUP);
+  pinMode(PIN_MANUAL_DISPENSE, INPUT_PULLUP);
+  pinMode(PIN_SERVICE_DOOR, INPUT_PULLUP);
+  pinMode(PIN_SHUTTER, INPUT_PULLUP);
+  pinMode(PIN_CAN_EXIT, INPUT_PULLUP);
+
+
+  // ----------------------------------------------------------
+  // IR SENSORS
+  // ----------------------------------------------------------
+
+  pinMode(PIN_TRAY_SENSOR, INPUT);
+  pinMode(PIN_NEXT_CAN, INPUT);
+
+
+  // ----------------------------------------------------------
+  // DEBOUNCED INPUT INITIALIZATION
+  // ----------------------------------------------------------
+
+  initDebouncedInput(
+    wantButton,
+    PIN_WANT_BUTTON
+  );
+
+  initDebouncedInput(
+    manualDispense,
+    PIN_MANUAL_DISPENSE
+  );
+
+  initDebouncedInput(
+    shutter,
+    PIN_SHUTTER
+  );
+
+  initDebouncedInput(
+    serviceDoor,
+    PIN_SERVICE_DOOR
+  );
+
+  initDebouncedInput(
+    canExit,
+    PIN_CAN_EXIT
+  );
+
+  initDebouncedInput(
+    traySensor,
+    PIN_TRAY_SENSOR
+  );
+
+  delay(500);
+  setupPaymentIntegration();
+
+  // ----------------------------------------------------------
+  // STARTUP READINESS
+  // ----------------------------------------------------------
+
+  if (paymentFaultLatch || !paymentNvsReady) changeState(ERROR_STATE);
+  else runReadinessCheck(IDLE);
+  printReadinessDiagnostics();
+  Serial.println("[MTA] Setup complete, starting UART integrity diagnostic (Wi-Fi + Heartbeat + Events)");
+  Serial.println("[MTA TEST] v0.4.13 Test LOAD + FIFO Delivery; LOAD/SALE/ERROR upload ON; heartbeat ON; NTP ON");
+  setupCommunication();
+}
+
+
+// ============================================================
+// LOOP
+// ============================================================
+
+void loop() {
+
+  processEventTestCommands();
+  processEventDelivery(); // FIFO upload runs via network task; NVS belongs to main loop.
+  processPayment();
+  processInputs();
+  processPayment();
+
+
+  // ----------------------------------------------------------
+  // TIMERS
+  // ----------------------------------------------------------
+
+  processDispenseTimeout();
+
+  // NEW v0.3.5
+  processManualHoldTimer();
+  processServiceDispenseTimeout();
+
+  processEmptyTimer();
+
+  // NEW v0.3.4
+  processShutterRecoveryTimer();
+
+
+  // ----------------------------------------------------------
+  // HARD MOTOR SAFETY
+  // ----------------------------------------------------------
+
+  if (currentState != DISPENSING &&
+      currentState != SERVICE_DISPENSING) {
+    motorOff();
+  }
+
+
+  if (!MOTOR_ENABLED) {
+    motorOff();
+  }
+
+  if (MTA_ENABLE_NETWORK_TASK) processCommunication();
+}
+
