@@ -1993,6 +1993,23 @@ void processEventTestCommands() {
     else if (command == 'N' || command == 'n') printNvsDiagnostics();
     else if (command == 'R' || command == 'r') restoreEventSequence13();
     else if (command == 'Q' || command == 'q') printPaymentDiagnostics();
+    else if (command == 'V' || command == 'v') {
+      if (!serviceDoorOpen() || motorRunning || paymentSessionOpen ||
+          !payment.isIdle() || payment.diagnosticPending())
+        Serial.println("[HYBRID] V refused: open service door and stop motor/payment");
+      else payment.setIdleRxMode(
+          payment.idleRxMode() == PaymentManager::IdleRxMode::NORMAL
+          ? PaymentManager::IdleRxMode::DISCARD_IDLE
+          : PaymentManager::IdleRxMode::NORMAL);
+    }
+    else if (command == 'H' || command == 'J') {
+      if (!serviceDoorOpen() || motorRunning || paymentSessionOpen ||
+          !payment.isIdle() || payment.uncertainFinancialResult())
+        Serial.println("[HYBRID] Picture REFUSED: requires open door and no active payment");
+      else if (!payment.diagnosticShowPicture(command == 'H' ? 2 : 1))
+        Serial.println("[HYBRID] Picture REFUSED: busy");
+    }
+    else if (command == 'W' || command == 'w') payment.printUartWindow();
     else if (command == 'X') clearPaymentInterlock();
   }
 }
@@ -2515,7 +2532,7 @@ void clearPaymentInterlock() {
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("[MTA] WANT!PAY!TAKE! Firmware v0.4.13 Test LOAD + FIFO Delivery starting");
+  Serial.println("[MTA] WANT!PAY!TAKE! Firmware v0.4.14-DIAG (v0.4.13 + UART hybrid) starting");
   setupEventManager();
   Serial.println("[MTA EVT] v0.4.13: FIFO LOAD/SALE/ERROR upload; D=service LOAD+1; L=list I=stock Q=payment");
 
@@ -2615,6 +2632,8 @@ void setup() {
   if (paymentFaultLatch || !paymentNvsReady) changeState(ERROR_STATE);
   else runReadinessCheck(IDLE);
   printReadinessDiagnostics();
+  Serial.println("[HYBRID] V=toggle idle RX; W=RX window; H=ShowPicture(2); J=ShowPicture(1)");
+  Serial.println("[HYBRID] Picture diagnostics require service door OPEN; no payment/NVS effects.");
   Serial.println("[MTA] Setup complete, starting UART integrity diagnostic (Wi-Fi + Heartbeat + Events)");
   Serial.println("[MTA TEST] v0.4.13 Test LOAD + FIFO Delivery; LOAD/SALE/ERROR upload ON; heartbeat ON; NTP ON");
   setupCommunication();
