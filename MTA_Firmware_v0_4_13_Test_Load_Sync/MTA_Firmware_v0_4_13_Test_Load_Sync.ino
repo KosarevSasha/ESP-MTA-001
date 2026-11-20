@@ -2407,7 +2407,7 @@ void startPaidSession() {
   if (!stockAccountingHealthy || !eventJournalReady ||
       eventDeliveryBlocked || eventCount >= MTA_EVENT_CAPACITY ||
       eventPrefs.isKey("stockop") ||
-      currentState != IDLE || paymentFaultLatch || paymentSessionOpen ||
+      currentState != IDLE || paymentFaultLatch || paymentSessionOpen || payment.diagnosticPending() ||
       !payment.isIdle() || payment.uncertainFinancialResult() ||
       serviceDoorOpen() || shutterRaised() || canExitAbnormal() ||
       !nextCanPresent() || trayOccupied()) {
