@@ -10,6 +10,7 @@ void PaymentManager::begin(const Config &cfg, EventCallback onEvent, TimerCallba
   cfg_ = cfg; cb_ = onEvent; tcb_ = onTimer; ctx_ = ctx;
   state_ = State::IDLE; awaiting_ = Await::NONE;
   timer_ = Timer::NONE; uncertain_ = false; used_ = 0;
+  diagPending_ = false; windowAt_ = millis();
   uart_.setRxBufferSize(4096);
   uart_.begin(cfg_.baud, SERIAL_8N1, cfg_.rxPin, cfg_.txPin);
   // Diagnostic only. Callback runs in UART event task; do not log or touch
@@ -144,7 +145,7 @@ void PaymentManager::sendCancelLast() {
   send(b,sizeof(b),Await::REFUND);
 }
 bool PaymentManager::startPayment(uint32_t priceKopecks,uint16_t humanItemNumber) {
-  if (state_ != State::IDLE || uncertain_) return false;
+  if (state_ != State::IDLE || uncertain_ || diagPending_) return false;
   if (priceKopecks == 0 || priceKopecks > 65535 || humanItemNumber == 0 || humanItemNumber > 255) {
     event(Event::PAYMENT_ERROR,Error::BAD_ARGUMENT); return false;
   }
@@ -199,6 +200,19 @@ void PaymentManager::fail(Error reason,bool financialUncertain) {
   }
 }
 void PaymentManager::ack(uint16_t c) {
+  if (diagPending_) {
+    if (c == diagExpectedAck_) {
+      ++diagAckMatches_;
+      diagPending_ = false;
+      Serial.printf("[HYBRID] DIAG_ACK_OK crc=%04X latencyMs=%lu matched=%lu\n",
+                    (unsigned)c, (unsigned long)(millis()-diagSentAt_),
+                    (unsigned long)diagAckMatches_);
+    } else {
+      Serial.printf("[HYBRID] DIAG_ACK_OTHER crc=%04X expected=%04X\n",
+                    (unsigned)c, (unsigned)diagExpectedAck_);
+    }
+    return;
+  }
   if (awaiting_ == Await::NONE || c != expectedAck_) {
     Serial.printf("[PM TRACE] RX ACK_UNMATCHED crc=%04X expected=%04X pending=%s PM=%s\n",
                   (unsigned)c, (unsigned)expectedAck_, awaitName(awaiting_), stateName(state_));
@@ -334,13 +348,83 @@ void PaymentManager::receiveByte(uint8_t b) {
     frame(packet,len);
   }
 }
+void PaymentManager::setIdleRxMode(IdleRxMode mode) {
+  if (state_ != State::IDLE || awaiting_ != Await::NONE || diagPending_) {
+    Serial.println("[HYBRID] Mode change refused: busy");
+    return;
+  }
+  idleRxMode_ = mode;
+  used_ = 0;
+  Serial.printf("[HYBRID] IDLE_RX=%s (payment packets ALWAYS parsed)\n",
+                mode == IdleRxMode::NORMAL ? "NORMAL" : "DISCARD_IDLE");
+}
+
+bool PaymentManager::diagnosticShowPicture(uint8_t index) {
+  if ((index != 1 && index != 2) || state_ != State::IDLE ||
+      awaiting_ != Await::NONE || diagPending_ || uncertain_) return false;
+  // Flush old incoming background bytes, not financial data.
+  while (uart_.available()) {
+    const int b = uart_.read();
+    if (b < 0) break;
+    ++rawRxBytes_; ++windowRx_; ++discardedBytes_; ++windowDropped_;
+    if (b == 0xFF) ++windowFF_;
+    else if (b == 0x00) ++windowZero_;
+  }
+  used_ = 0;
+  const uint8_t body[] = {0x03, index};
+  const uint16_t c = crc(body, sizeof(body));
+  const uint8_t packet[] = {2, 0, uint8_t(c), uint8_t(c >> 8), body[0], body[1]};
+  diagExpectedAck_ = c;
+  diagPending_ = true;
+  diagSentAt_ = millis();
+  const size_t written = uart_.write(packet, sizeof(packet));
+  uart_.flush();
+  Serial.printf("[HYBRID] DIAG_TX picture=%u bytes=%u expectedACK=%04X\n",
+                (unsigned)index, (unsigned)written, (unsigned)c);
+  if (written != sizeof(packet)) {
+    diagPending_ = false;
+    Serial.println("[HYBRID] DIAG_TX_FAILED");
+    return false;
+  }
+  return true;
+}
+
+void PaymentManager::printUartWindow() {
+  Serial.printf("[HYBRID] RX_WINDOW ms=%lu bytes=%lu FF=%lu ZERO=%lu OTHER=%lu "
+                "discardedIdle=%lu mode=%s diagPending=%u matches=%lu timeouts=%lu\n",
+                (unsigned long)(millis()-windowAt_),
+                (unsigned long)windowRx_, (unsigned long)windowFF_,
+                (unsigned long)windowZero_,
+                (unsigned long)(windowRx_-windowFF_-windowZero_),
+                (unsigned long)windowDropped_,
+                idleRxMode_ == IdleRxMode::NORMAL ? "NORMAL" : "DISCARD_IDLE",
+                (unsigned)diagPending_, (unsigned long)diagAckMatches_,
+                (unsigned long)diagAckTimeouts_);
+  windowAt_ = millis();
+  windowRx_ = windowFF_ = windowZero_ = windowDropped_ = 0;
+}
+
 void PaymentManager::update() {
   const int pending = uart_.available();
   if (pending > 0 && (uint32_t)pending > peakRxPending_)
     peakRxPending_ = (uint32_t)pending;
+  const bool dropIdle = idleRxMode_ == IdleRxMode::DISCARD_IDLE &&
+      state_ == State::IDLE && awaiting_ == Await::NONE && !diagPending_;
   size_t budget = 2048;
   while (uart_.available() && budget--) {
-    const int b = uart_.read(); if (b >= 0) receiveByte(uint8_t(b));
+    const int b = uart_.read();
+    if (b < 0) continue;
+    ++windowRx_;
+    if (b == 0xFF) ++windowFF_;
+    else if (b == 0x00) ++windowZero_;
+    if (dropIdle) {
+      ++rawRxBytes_; ++discardedBytes_; ++windowDropped_; used_ = 0;
+    } else receiveByte(uint8_t(b));
+  }
+  if (diagPending_ && uint32_t(millis()-diagSentAt_) >= cfg_.ackMs) {
+    diagPending_ = false; ++diagAckTimeouts_;
+    Serial.printf("[HYBRID] DIAG_ACK_TIMEOUT expected=%04X count=%lu\n",
+                  (unsigned)diagExpectedAck_, (unsigned long)diagAckTimeouts_);
   }
   if (used_ && uint32_t(millis()-rxStarted_) >= 1000) {
     ++partialFrameTimeouts_;
