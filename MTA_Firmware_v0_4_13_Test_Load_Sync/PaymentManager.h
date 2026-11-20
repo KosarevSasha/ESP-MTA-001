@@ -33,6 +33,12 @@ public:
   explicit PaymentManager(HardwareSerial &uart);
   void begin(const Config &cfg, EventCallback onEvent, TimerCallback onTimer, void *ctx = nullptr);
   void update();
+  enum class IdleRxMode : uint8_t { NORMAL, DISCARD_IDLE };
+  void setIdleRxMode(IdleRxMode m);
+  IdleRxMode idleRxMode() const { return idleRxMode_; }
+  bool diagnosticShowPicture(uint8_t index);
+  bool diagnosticPending() const { return diagPending_; }
+  void printUartWindow();
   bool startPayment(uint32_t priceKopecks, uint16_t humanItemNumber);
   bool confirmDispensed();
   bool reportNotDispensed();
@@ -93,6 +99,12 @@ private:
   volatile uint32_t hwBreak_ = 0, hwBufferFull_ = 0, hwFifoOverflow_ = 0;
   volatile uint32_t hwFrame_ = 0, hwParity_ = 0;
   uint32_t peakRxPending_ = 0;
+  IdleRxMode idleRxMode_ = IdleRxMode::NORMAL;
+  bool diagPending_ = false;
+  uint16_t diagExpectedAck_ = 0;
+  uint32_t diagSentAt_ = 0, diagAckMatches_ = 0, diagAckTimeouts_ = 0;
+  uint32_t windowAt_ = 0, windowRx_ = 0, windowFF_ = 0;
+  uint32_t windowZero_ = 0, windowDropped_ = 0;
 
   void event(Event e, Error err = Error::NONE);
   void timer(Timer which, uint32_t durationMs = 0);
